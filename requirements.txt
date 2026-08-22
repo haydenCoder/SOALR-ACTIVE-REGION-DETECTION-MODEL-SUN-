@@ -1,0 +1,8 @@
+numpy>=1.26,<3.0
+Pillow>=10.4,<12.0
+tqdm>=4.66,<5.0
+torch>=2.4,<3.0
+# Optional: FITS support for heliophysics archives
+astropy>=6.1,<7.0
+h5py>=3.11,<4.0
+netCDF4>=1.7,<2.0
