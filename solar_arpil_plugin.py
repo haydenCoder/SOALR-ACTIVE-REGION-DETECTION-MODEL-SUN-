@@ -61,10 +61,10 @@ MASK_SPLIT_URLS = {
     "leaky_validation": "https://huggingface.co/datasets/nasa-ibm-ai4science/surya-bench-ar-segmentation/raw/main/leaky_validation.csv",
 }
 CORE_INDEX_URLS = {
-    "train": "https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo/resolve/main/train_index_surya_1_0.csv?download=true",
-    "validation": "https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo/raw/main/valid_index_surya_1_0.csv",
+    "train": "https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo/resolve/main/train.csv?download=true",
+    "validation": "https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo/resolve/main/val.csv?download=true",
     "test": "https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo/resolve/main/test.csv?download=true",
-    "leaky_validation": "https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo/raw/main/valid_index_surya_1_0.csv",
+    "leaky_validation": "https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo/resolve/main/val.csv?download=true",
 }
 MASK_BASE_URL = "https://huggingface.co/datasets/nasa-ibm-ai4science/surya-bench-ar-segmentation/resolve/main/"
 CORE_BUCKET = "nasa-surya-bench"
@@ -916,7 +916,7 @@ def update_progress_markdown(run_dir: Path, total_epochs: int, last: EpochMetric
 def make_preview_image(image: np.ndarray, mask: np.ndarray, pred: np.ndarray, labels: list[str]) -> "Image.Image":
     def gray_panel(arr: np.ndarray) -> "Image.Image":
         arr = np.clip(arr, 0.0, 1.0)
-        return Image.fromarray((arr * 255).astype(np.uint8), mode="L").convert("RGB")
+        return Image.fromarray((arr * 255).astype(np.uint8)).convert("RGB")
 
     def overlay_panel(base: np.ndarray, overlay: np.ndarray, color: tuple[int, int, int]) -> "Image.Image":
         img = gray_panel(base)
