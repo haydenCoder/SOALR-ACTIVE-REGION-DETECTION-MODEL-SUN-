@@ -125,3 +125,107 @@ def test_download_invoked_once_when_archive_absent(tmp_path: Path, monkeypatch):
     # A second call sees the now-present file and must not re-download.
     ma.ensure_downloaded()
     assert len(calls) == 1
+
+
+# --- partial-download / composition reporting ---------------------------------
+
+
+def test_composition_reports_achieved_and_target_mix(tmp_path: Path, monkeypatch):
+    """build_manifest_and_synthetic must record and log the real/synthetic mix."""
+    import json
+
+    dataset_dir = tmp_path / "ds"
+    (dataset_dir / "tiles").mkdir(parents=True)
+
+    import numpy as np
+
+    real_ids = []
+    for i in range(10):
+        sid = f"frame_{i:03d}"
+        plugin.write_tile_h5(
+            dataset_dir / "tiles" / f"{sid}.h5",
+            np.random.rand(1, 8, 8).astype("float32"),
+            (np.random.rand(1, 8, 8) > 0.5).astype("float32"),
+            {"sample_id": sid, "source_type": "real"},
+        )
+        real_ids.append(sid)
+
+    lines: list[str] = []
+
+    class _Log:
+        def log(self, msg):
+            lines.append(str(msg))
+
+        def debug(self, msg):
+            lines.append(str(msg))
+
+    plugin.build_manifest_and_synthetic(
+        dataset_dir=dataset_dir,
+        real_ids=real_ids,
+        channels=["a"],
+        val_ratio=0.2,
+        synthetic_ratio=0.30,
+        seed=1,
+        provenance_rows=[],
+        logger=_Log(),
+        frames_requested=10,
+        frames_downloaded=7,
+    )
+
+    comp = json.loads((dataset_dir / "dataset_composition.json").read_text())
+    assert comp["target_real_percent"] == 70.0
+    assert comp["target_synthetic_percent"] == 30.0
+    assert comp["frames_requested"] == 10
+    assert comp["frames_downloaded"] == 7
+    # 7 of 10 frames arrived -> the run must be flagged incomplete.
+    assert comp["download_complete"] is False
+    assert comp["train_real"] + comp["train_synthetic"] == comp["train_total"]
+    assert abs(comp["real_percent"] + comp["synthetic_percent"] - 100.0) < 0.01
+
+    text = "\n".join(lines)
+    assert "Train REAL" in text and "Train SYNTHETIC" in text
+    assert "PARTIAL real set" in text
+
+
+def test_composition_marks_complete_when_all_frames_arrive(tmp_path: Path):
+    import json
+
+    import numpy as np
+
+    dataset_dir = tmp_path / "ds"
+    (dataset_dir / "tiles").mkdir(parents=True)
+    real_ids = []
+    for i in range(10):
+        sid = f"frame_{i:03d}"
+        plugin.write_tile_h5(
+            dataset_dir / "tiles" / f"{sid}.h5",
+            np.random.rand(1, 8, 8).astype("float32"),
+            (np.random.rand(1, 8, 8) > 0.5).astype("float32"),
+            {"sample_id": sid, "source_type": "real"},
+        )
+        real_ids.append(sid)
+
+    class _Log:
+        def log(self, msg):
+            pass
+
+        def debug(self, msg):
+            pass
+
+    plugin.build_manifest_and_synthetic(
+        dataset_dir=dataset_dir,
+        real_ids=real_ids,
+        channels=["a"],
+        val_ratio=0.2,
+        synthetic_ratio=0.30,
+        seed=1,
+        provenance_rows=[],
+        logger=_Log(),
+        frames_requested=10,
+        frames_downloaded=10,
+    )
+    comp = json.loads((dataset_dir / "dataset_composition.json").read_text())
+    assert comp["download_complete"] is True
+    # Mix should land on the requested 70/30 within rounding.
+    assert abs(comp["real_percent"] - 70.0) < 5.0
+    assert abs(comp["synthetic_percent"] - 30.0) < 5.0

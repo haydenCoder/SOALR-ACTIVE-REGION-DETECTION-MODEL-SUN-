@@ -865,6 +865,8 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
     real_ids: list[str] = []
     provenance_rows: list[dict[str, str]] = []
     empty_counter = 0
+    frames_ok = 0
+    failed_frames: list[dict[str, str]] = []
 
     for frame_index, item in enumerate(selected, start=1):
         timestamp = item["timestamp"]
@@ -874,14 +876,28 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
         logger.log(f"[{frame_index}/{len(selected)}] fetching {timestamp}")
         logger.debug(f"core_s3_key={core_key} -> {core_local}")
         logger.debug(f"mask_member={mask_rel}")
-        download_core_s3(s3_client, core_key, core_local)
-        mask_local = mask_archive.extract(mask_rel)
+        # A single unreachable frame must not destroy an otherwise good run: at
+        # ~570 MB per frame a long download is very likely to hit at least one
+        # transient error. Record it, keep the real tiles already on disk, and
+        # let the synthetic backfill make up the shortfall.
+        try:
+            download_core_s3(s3_client, core_key, core_local)
+            mask_local = mask_archive.extract(mask_rel)
 
-        stack = read_core_stack(core_local, args.channels)
-        mask_full = read_arpil_mask(mask_local, args.mask_key)[None]
-        if stack.shape[1:] != mask_full.shape[1:]:
-            raise ValueError(f"Shape mismatch for {timestamp}: image={stack.shape[1:]} mask={mask_full.shape[1:]}")
+            stack = read_core_stack(core_local, args.channels)
+            mask_full = read_arpil_mask(mask_local, args.mask_key)[None]
+            if stack.shape[1:] != mask_full.shape[1:]:
+                raise ValueError(f"Shape mismatch for {timestamp}: image={stack.shape[1:]} mask={mask_full.shape[1:]}")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any frame-level failure is recoverable
+            reason = f"{type(exc).__name__}: {exc}"
+            failed_frames.append({"timestamp": timestamp, "core_key": core_key, "mask_path": mask_rel, "reason": reason})
+            logger.log(f"[{frame_index}/{len(selected)}] FRAME FAILED {timestamp} -> {reason}")
+            logger.log("  continuing; this frame's share will be covered by synthetic samples")
+            continue
 
+        frame_tiles = 0
         ys = iter_starts(mask_full.shape[1], args.tile_size, args.tile_stride)
         xs = iter_starts(mask_full.shape[2], args.tile_size, args.tile_stride)
         for y in ys:
@@ -911,6 +927,7 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
                     },
                 )
                 real_ids.append(sample_id)
+                frame_tiles += 1
                 logger.debug(f"keep_real_tile sample_id={sample_id} mask_fraction={fraction:.5f}")
                 provenance_rows.append(
                     {
@@ -924,6 +941,34 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
                         "notes": f"mask_fraction={fraction:.5f}",
                     }
                 )
+        frames_ok += 1
+        logger.log(f"[{frame_index}/{len(selected)}] ok {timestamp} -> {frame_tiles} real tiles (running total {len(real_ids)})")
+
+    download_complete = not failed_frames
+    logger.log("--- Download summary ---")
+    logger.log(f"Frames requested : {len(selected)}")
+    logger.log(f"Frames downloaded: {frames_ok}")
+    logger.log(f"Frames failed    : {len(failed_frames)}")
+    logger.log(f"Download complete: {'yes' if download_complete else 'NO (incomplete)'}")
+    logger.log(f"Real tiles built : {len(real_ids)}")
+    if failed_frames:
+        with (metadata_dir / "failed_frames.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["timestamp", "core_key", "mask_path", "reason"])
+            writer.writeheader()
+            writer.writerows(failed_frames)
+        logger.log(f"Failed frames written to: {metadata_dir / 'failed_frames.csv'}")
+        for entry in failed_frames[:10]:
+            logger.log(f"  failed {entry['timestamp']}: {entry['reason']}")
+        if len(failed_frames) > 10:
+            logger.log(f"  ... and {len(failed_frames) - 10} more")
+
+    if not real_ids:
+        raise RuntimeError(
+            "No real tiles could be built - every frame download failed. "
+            "Synthetic samples are derived from real tiles, so training cannot start. "
+            f"See {metadata_dir / 'failed_frames.csv'} for the per-frame reasons, and check "
+            "network access to the S3 bucket and Hugging Face (see LIGHTNING_AI_TRAINING_GUIDE.md section 1b)."
+        )
 
     build_manifest_and_synthetic(
         dataset_dir=dataset_dir,
@@ -934,6 +979,8 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
         seed=args.seed,
         provenance_rows=provenance_rows,
         logger=logger,
+        frames_requested=len(selected),
+        frames_downloaded=frames_ok,
     )
 
     with (dataset_dir / "sources_used.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -959,6 +1006,8 @@ def build_manifest_and_synthetic(
     seed: int,
     provenance_rows: list[dict[str, str]],
     logger: Logger,
+    frames_requested: int = 0,
+    frames_downloaded: int = 0,
 ) -> None:
     rng = random.Random(seed)
     tiles_dir = dataset_dir / "tiles"
@@ -1034,9 +1083,52 @@ def build_manifest_and_synthetic(
         writer.writerows(provenance_rows)
 
     unique_count = len({row["sample_id"] for row in provenance_rows})
-    logger.log(f"Real samples: {len(real_ids)}")
-    logger.log(f"Train real: {len(train_real_ids)} | Synthetic train: {len(synth_ids)} | Val real: {len(val_real_ids)}")
-    logger.log(f"Unique sample IDs: {unique_count}")
+    train_total = len(train_real_ids) + len(synth_ids)
+    real_pct = 100.0 * len(train_real_ids) / train_total if train_total else 0.0
+    synth_pct = 100.0 * len(synth_ids) / train_total if train_total else 0.0
+    target_real_pct = 100.0 * (1.0 - synthetic_ratio)
+    target_synth_pct = 100.0 * synthetic_ratio
+
+    composition = {
+        "frames_requested": frames_requested,
+        "frames_downloaded": frames_downloaded,
+        "download_complete": frames_requested == 0 or frames_downloaded >= frames_requested,
+        "train_real": len(train_real_ids),
+        "train_synthetic": len(synth_ids),
+        "train_total": train_total,
+        "val_real": len(val_real_ids),
+        "real_percent": round(real_pct, 2),
+        "synthetic_percent": round(synth_pct, 2),
+        "target_real_percent": round(target_real_pct, 2),
+        "target_synthetic_percent": round(target_synth_pct, 2),
+        "unique_sample_ids": unique_count,
+    }
+    composition_path = dataset_dir / "dataset_composition.json"
+    composition_path.write_text(json.dumps(composition, indent=2), encoding="utf-8")
+
+    logger.log("--- Dataset composition ---")
+    if frames_requested:
+        state = "COMPLETE" if composition["download_complete"] else "INCOMPLETE"
+        logger.log(f"Real-image download: {state} ({frames_downloaded}/{frames_requested} frames)")
+    logger.log(f"Real samples (all)  : {len(real_ids)}")
+    logger.log(f"Train REAL          : {len(train_real_ids)} ({real_pct:.1f}%, target {target_real_pct:.1f}%)")
+    logger.log(f"Train SYNTHETIC     : {len(synth_ids)} ({synth_pct:.1f}%, target {target_synth_pct:.1f}%)")
+    logger.log(f"Train total         : {train_total}")
+    logger.log(f"Val real            : {len(val_real_ids)}")
+    if train_total and abs(real_pct - target_real_pct) > 1.0:
+        logger.log(
+            f"NOTE: actual mix {real_pct:.1f}/{synth_pct:.1f} differs from the requested "
+            f"{target_real_pct:.0f}/{target_synth_pct:.0f} split "
+            "(too few real tiles to pair, or frames failed to download)."
+        )
+    if frames_requested and not composition["download_complete"]:
+        logger.log(
+            "NOTE: training is starting on a PARTIAL real set. Synthetic samples were "
+            "generated from the real tiles that did download. Re-run with --force-rebuild-dataset "
+            "once the network is healthy to pick up the missing frames."
+        )
+    logger.log(f"Unique sample IDs   : {unique_count}")
+    logger.log(f"Composition saved   : {composition_path}")
     logger.log(f"Manifest: {manifest_path}")
     logger.log(f"Saved provenance: {provenance_path}")
 
@@ -1293,6 +1385,29 @@ def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logg
     val_dataset = H5TileDataset(manifest_path, split="val", augment=False, seed=args.seed)
     with manifest_path.open("r", newline="", encoding="utf-8") as handle:
         val_rows = [row for row in csv.DictReader(handle) if row["split"] == "val"]
+
+    # Restate the mix from the manifest actually being trained on, so the number
+    # is visible even on a resumed run that skipped the dataset build.
+    train_real = sum(1 for row in train_dataset.rows if row.get("source_type") == "real")
+    train_synth = sum(1 for row in train_dataset.rows if row.get("source_type") == "synthetic")
+    train_total = train_real + train_synth
+    if train_total:
+        logger.log(
+            f"Training mix: {train_real} real ({100.0 * train_real / train_total:.1f}%) + "
+            f"{train_synth} synthetic ({100.0 * train_synth / train_total:.1f}%) = {train_total} samples"
+        )
+    composition_path = dataset_dir / "dataset_composition.json"
+    if composition_path.exists():
+        try:
+            saved = json.loads(composition_path.read_text(encoding="utf-8"))
+            if not saved.get("download_complete", True):
+                logger.log(
+                    f"WARNING: real-image download was INCOMPLETE "
+                    f"({saved.get('frames_downloaded')}/{saved.get('frames_requested')} frames). "
+                    "Training on the partial real set plus synthetic backfill."
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.log(f"Device: {device}")

@@ -148,6 +148,64 @@ python3 solar_arpil_plugin.py \
 
 ---
 
+## 2b) Reading the real/synthetic log
+
+The run prints the mix twice. After the dataset is built:
+
+```
+--- Download summary ---
+Frames requested : 48
+Frames downloaded: 48
+Frames failed    : 0
+Download complete: yes
+Real tiles built : 812
+--- Dataset composition ---
+Real-image download: COMPLETE (48/48 frames)
+Train REAL          : 690 (69.9%, target 70.0%)
+Train SYNTHETIC     : 297 (30.1%, target 30.0%)
+Train total         : 987
+Val real            : 122
+```
+
+and again right before epoch 1, which is the line that also shows up on a
+resumed run that reused an existing dataset:
+
+```
+Training mix: 690 real (69.9%) + 297 synthetic (30.1%) = 987 samples
+```
+
+The same numbers are written to `<work-dir>/dataset/dataset_composition.json`.
+
+### When the download does not finish
+
+Frame downloads are ~570 MB each, so a long run will usually hit at least one
+transient error. A failed frame no longer aborts the run: it is logged, recorded
+in `<work-dir>/dataset/metadata/failed_frames.csv`, and skipped.
+
+```
+[17/48] FRAME FAILED 2011-03-02 12:00:00 -> EndpointConnectionError: ...
+  continuing; this frame's share will be covered by synthetic samples
+...
+Download complete: NO (incomplete)
+NOTE: training is starting on a PARTIAL real set. Synthetic samples were
+generated from the real tiles that did download.
+```
+
+Because synthetic samples are blended from real tiles, the 70/30 ratio is
+maintained against whatever real data *did* arrive — so training still starts,
+just on a smaller real base. Resumed runs re-print the warning:
+
+```
+WARNING: real-image download was INCOMPLETE (31/48 frames).
+```
+
+To pick up the missing frames later, re-run the same command with
+`--force-rebuild-dataset`. If *every* frame fails the run stops with an
+explanatory error rather than training on synthetic-only data, since there would
+be no real signal to blend from.
+
+---
+
 ## 3) Fallback mode if ARPIL/core-SDO downloads are blocked
 
 If Lightning can reach GitHub but not Hugging Face / AWS, use the SHARP fallback mode:
