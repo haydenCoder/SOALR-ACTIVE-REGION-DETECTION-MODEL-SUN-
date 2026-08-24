@@ -168,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
             "views, 'd4' averages all 8 symmetries for the best accuracy."
         ),
     )
+    optim.add_argument("--resume", action="store_true", help="Resume training from the last checkpoint in output-dir")
     return parser
 
 
