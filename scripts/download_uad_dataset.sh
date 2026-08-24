@@ -41,6 +41,10 @@ ensure_7zz() {
     echo "7z"
     return
   fi
+  if command -v 7zz >/dev/null 2>&1; then
+    echo "7zz"
+    return
+  fi
   if [[ -x "${SEVEN_Z_BIN}" ]]; then
     echo "${SEVEN_Z_BIN}"
     return
