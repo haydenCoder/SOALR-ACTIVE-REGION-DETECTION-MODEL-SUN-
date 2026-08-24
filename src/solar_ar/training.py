@@ -358,7 +358,7 @@ class Trainer:
             **loader_kwargs,
         )
 
-        self.model = AttentionUNet(
+        self.raw_model = AttentionUNet(
             in_channels=len(channels),
             out_channels=1,
             base_channels=base_channels,
@@ -368,11 +368,19 @@ class Trainer:
             use_se=use_se,
             norm_groups=norm_groups,
             deep_supervision=deep_supervision,
-        ).to(self.device)
+        )
+        
+        if torch.cuda.device_count() > 1:
+            print(f"[GPU] Using {torch.cuda.device_count()} GPUs with DataParallel")
+            self.model = nn.DataParallel(self.raw_model)
+        else:
+            self.model = self.raw_model
+
+        self.model = self.model.to(self.device)
         if self.channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
 
-        self.ema = ModelEma(self.model, decay=ema_decay) if ema_decay > 0 else None
+        self.ema = ModelEma(self.raw_model, decay=ema_decay) if ema_decay > 0 else None
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=learning_rate,
@@ -416,12 +424,12 @@ class Trainer:
 
             # Validate with the EMA weights when available: they are what we
             # would actually deploy, so early stopping should track them.
-            backup = self.ema.copy_to(self.model) if self.ema is not None else None
+            backup = self.ema.copy_to(self.raw_model) if self.ema is not None else None
             try:
                 val_loss, val_dice, val_iou = self._run_epoch(epoch, training=False)
             finally:
                 if backup is not None:
-                    self.model.load_state_dict(backup)
+                    self.raw_model.load_state_dict(backup)
 
             elapsed = perf_counter() - start
             samples = max(1, len(self.train_loader.dataset))
@@ -511,7 +519,7 @@ class Trainer:
                     # Per-step LR schedule (warmup + cosine).
                     self.scheduler.step()
                     if self.ema is not None:
-                        self.ema.update(self.model)
+                        self.ema.update(self.raw_model)
 
             total_loss += float(loss.item())
             batches += 1
@@ -539,7 +547,7 @@ class Trainer:
 
     def _save_checkpoint(self, path: Path, metrics: EpochMetrics) -> None:
         payload = {
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": self.raw_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "channels": self.channels,

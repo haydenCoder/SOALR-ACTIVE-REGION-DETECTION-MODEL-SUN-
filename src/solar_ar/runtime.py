@@ -20,9 +20,9 @@ import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-#: Project defaults: the 15 GB / 4 CPU preset this repo targets.
-DEFAULT_MEMORY_BUDGET_GB = 15.0
-DEFAULT_CPU_BUDGET = 4
+#: Project defaults: if <= 0, we use all detected resources.
+DEFAULT_MEMORY_BUDGET_GB = 0.0
+DEFAULT_CPU_BUDGET = 0
 
 #: Environment variables read by the numeric libraries at import time.
 _THREAD_ENV_VARS = (
@@ -47,6 +47,7 @@ class ResourcePlan:
     interop_threads: int
     memory_detected_gb: float
     memory_budget_gb: float
+    disk_free_gb: float
     dataloader_workers: int
     prefetch_factor: int | None
     persistent_workers: bool
@@ -59,7 +60,8 @@ class ResourcePlan:
             f"(torch threads={self.torch_threads}, interop={self.interop_threads}, "
             f"loader workers={self.dataloader_workers})\n"
             f"RAM: budget {self.memory_budget_gb:.1f} GB of {self.memory_detected_gb:.1f} GB detected "
-            f"(sample cache {self.cache_budget_bytes / _BYTES_PER_GB:.2f} GB)"
+            f"(sample cache {self.cache_budget_bytes / _BYTES_PER_GB:.2f} GB)\n"
+            f"DISK: {self.disk_free_gb:.1f} GB available"
         )
 
 
@@ -113,6 +115,16 @@ def detect_cpu_count() -> int:
     return max(1, min(candidates))
 
 
+def detect_disk_gb() -> float:
+    """Return free disk space in GB for the current directory."""
+    import shutil
+    try:
+        total, used, free = shutil.disk_usage(".")
+        return free / _BYTES_PER_GB
+    except (OSError, ValueError):
+        return 0.0
+
+
 def detect_memory_gb() -> float:
     """Return usable RAM in GB, honouring cgroup limits."""
     candidates: list[float] = []
@@ -158,14 +170,18 @@ def plan_resources(
     so the same command works on a laptop and on the target box.
     """
     detected_cpus = detect_cpu_count()
-    requested_cpus = DEFAULT_CPU_BUDGET if cpu_budget is None or cpu_budget <= 0 else cpu_budget
-    effective_cpus = max(1, min(requested_cpus, detected_cpus))
+    requested_cpus = cpu_budget if cpu_budget is not None and cpu_budget > 0 else DEFAULT_CPU_BUDGET
+    if requested_cpus <= 0:
+        effective_cpus = detected_cpus
+    else:
+        effective_cpus = max(1, min(requested_cpus, detected_cpus))
 
     detected_memory = detect_memory_gb()
-    requested_memory = (
-        DEFAULT_MEMORY_BUDGET_GB if memory_budget_gb is None or memory_budget_gb <= 0 else memory_budget_gb
-    )
-    effective_memory = max(0.5, min(requested_memory, detected_memory))
+    requested_memory = memory_budget_gb if memory_budget_gb is not None and memory_budget_gb > 0 else DEFAULT_MEMORY_BUDGET_GB
+    if requested_memory <= 0:
+        effective_memory = detected_memory
+    else:
+        effective_memory = max(0.5, min(requested_memory, detected_memory))
 
     if dataloader_workers is None or dataloader_workers < 0:
         # Keep one core for the main process (which runs the model's math) and
@@ -190,6 +206,7 @@ def plan_resources(
         interop_threads=1 if effective_cpus <= 2 else 2,
         memory_detected_gb=detected_memory,
         memory_budget_gb=effective_memory,
+        disk_free_gb=detect_disk_gb(),
         dataloader_workers=workers,
         prefetch_factor=4 if workers > 0 else None,
         persistent_workers=workers > 0,
@@ -279,7 +296,7 @@ def suggest_batch_size(
     base_channels: int,
     memory_budget_gb: float,
     minimum: int = 1,
-    maximum: int = 64,
+    maximum: int = 256,
 ) -> int:
     """Estimate the largest batch that fits the RAM budget.
 
@@ -288,8 +305,23 @@ def suggest_batch_size(
     graph and the decoder's skip connections. Deliberately conservative -- it is
     a starting point for --auto-batch-size, not a hard guarantee.
     """
+    import torch
+    # If CUDA is available, we also need to consider VRAM.
+    # The suggest_batch_size function in this project is mostly RAM-based,
+    # but for "Full GPU Support", we should ideally check VRAM too.
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / _BYTES_PER_GB
+        # Use the smaller of RAM budget vs VRAM
+        memory_budget_gb = min(memory_budget_gb, vram_gb * 0.8)
+
     bytes_per_sample = image_size * image_size * base_channels * 4 * 26
     bytes_per_sample += image_size * image_size * channels * 4 * 4
-    usable = memory_budget_gb * 0.55 * _BYTES_PER_GB
+    usable = memory_budget_gb * 0.75 * _BYTES_PER_GB # Increased usage factor to 0.75 for "Full Support"
     estimate = int(usable // max(bytes_per_sample, 1))
+    
+    # If using DataParallel, we can scale the batch size by the number of GPUs
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    if num_gpus > 1:
+        estimate = estimate * num_gpus
+
     return max(minimum, min(maximum, estimate))

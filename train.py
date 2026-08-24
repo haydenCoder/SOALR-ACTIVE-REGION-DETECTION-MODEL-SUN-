@@ -21,7 +21,7 @@ from solar_ar.tta import TTA_PRESETS
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train an Attention U-Net for solar active region segmentation.")
-    parser.add_argument("--manifest", required=True, help="CSV manifest created by scripts/prepare_uad_manifest.py")
+    parser.add_argument("--manifest", default=None, help="CSV manifest created by scripts/prepare_uad_manifest.py. If omitted, will auto-download and prepare UAD dataset.")
     parser.add_argument("--channels", nargs="+", default=["171", "195", "284", "304"], help="Channel names to use")
     parser.add_argument("--image-size", type=int, default=256, help="Training crop/resize size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
@@ -43,7 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="percentile",
         help="Per-channel normalization strategy",
     )
-    parser.add_argument("--amp", action="store_true", help="Enable mixed precision when CUDA is available")
+    parser.add_argument("--amp", action="store_true", default=True, help="Enable mixed precision when CUDA is available")
+    parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable mixed precision")
     parser.add_argument("--patience", type=int, default=10, help="Early-stopping patience in epochs; use 0 to disable")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
@@ -107,7 +108,14 @@ def build_parser() -> argparse.ArgumentParser:
     hardware.add_argument(
         "--auto-batch-size",
         action="store_true",
+        default=True,
         help="Pick the largest batch size that fits the memory budget, overriding --batch-size.",
+    )
+    hardware.add_argument(
+        "--no-auto-batch-size",
+        dest="auto_batch_size",
+        action="store_false",
+        help="Disable automatic batch size selection.",
     )
     hardware.add_argument(
         "--no-channels-last",
@@ -163,8 +171,59 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+import subprocess
+
+def bootstrap_data() -> str:
+    manifest_path = Path("data/processed/uad_manifest.csv")
+    if manifest_path.exists():
+        return str(manifest_path)
+
+    import shutil
+    # Detect free disk space in GB
+    _, _, free_bytes = shutil.disk_usage(".")
+    free_gb = free_bytes / (1024**3)
+    
+    print(f"Detected {free_gb:.1f} GB free disk space.")
+
+    print("Manifest not found. Auto-downloading and preparing data...")
+    # 1. Download primary UAD dataset (~15GB)
+    if free_gb > 15:
+        print("Downloading UAD dataset...")
+        subprocess.run(["bash", "scripts/download_uad_dataset.sh"], check=True)
+    else:
+        print("Not enough disk space for UAD dataset (>15GB required).")
+
+    # 2. Download additional data if space allows (targeting expansion up to 100GB total)
+    _, _, free_bytes = shutil.disk_usage(".")
+    free_gb = free_bytes / (1024**3)
+    
+    if free_gb > 20 and Path("scripts/download_real_nasa_samples.sh").exists():
+         print("Extra space detected. Downloading additional NASA samples...")
+         subprocess.run(["bash", "scripts/download_real_nasa_samples.sh"], check=False)
+
+    _, _, free_bytes = shutil.disk_usage(".")
+    free_gb = free_bytes / (1024**3)
+    if free_gb > 40 and Path("scripts/download_smarp_sample.sh").exists():
+         print("Plenty of space detected. Downloading SMARP samples...")
+         subprocess.run(["bash", "scripts/download_smarp_sample.sh"], check=False)
+
+    # 3. Prepare manifest
+    print("Preparing manifest...")
+    subprocess.run([
+        sys.executable, "scripts/prepare_uad_manifest.py",
+        "--raw-root", "data/raw/Solar_data_UAD",
+        "--output", str(manifest_path)
+    ], check=True)
+
+    print(f"Data bootstrap complete. Manifest created at {manifest_path}")
+    return str(manifest_path)
+
+
 def main() -> None:
     args = build_parser().parse_args()
+
+    if args.manifest is None:
+        args.manifest = bootstrap_data()
 
     # --torch-num-threads predates --cpu-budget. When given explicitly it is a
     # deliberate override, so it becomes the CPU budget that drives the whole
