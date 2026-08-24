@@ -18,7 +18,12 @@ else
 fi
 
 echo "[2/5] Extracting outer ZIP..."
-unzip -o "${ARCHIVE_PATH}" -d "${EXTRACT_ROOT}" >/dev/null
+SEVEN_ZIP_CMD="$(ensure_7zz)"
+if [[ -n "${SEVEN_ZIP_CMD}" ]]; then
+  "${SEVEN_ZIP_CMD}" x -y -o"${EXTRACT_ROOT}" "${ARCHIVE_PATH}" >/dev/null
+else
+  unzip -o "${ARCHIVE_PATH}" -d "${EXTRACT_ROOT}" >/dev/null
+fi
 
 INNER_ROOT="$(find "${EXTRACT_ROOT}" -maxdepth 1 -type d -name 'MLMT-CNN_*' | head -n 1)"
 if [[ -z "${INNER_ROOT}" ]]; then
