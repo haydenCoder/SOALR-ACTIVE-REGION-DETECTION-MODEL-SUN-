@@ -31,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass, asdict
@@ -75,6 +76,12 @@ CORE_INDEX_URLS = {
     "leaky_validation": "https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo/resolve/main/val.csv?download=true",
 }
 MASK_BASE_URL = "https://huggingface.co/datasets/nasa-ibm-ai4science/surya-bench-ar-segmentation/resolve/main/"
+# The AR-segmentation repo does NOT expose the per-frame .h5 files individually:
+# its root holds only the CSV splits plus a single data.tar.gz (~1.31 GB) that
+# expands to the data/<year>/<month>/<stamp>.h5 tree the CSV "file_path" column
+# refers to. Requesting MASK_BASE_URL + file_path therefore 404s. We download the
+# archive once and extract frames from it on demand.
+MASK_ARCHIVE_URL = MASK_BASE_URL + "data.tar.gz?download=true"
 CORE_BUCKET = "nasa-surya-bench"
 DEFAULT_CHANNELS = ["aia171", "aia193", "hmi_m"]
 SHARP_SAMPLE_REPO = "https://github.com/mbobra/SHARPs.git"
@@ -435,6 +442,73 @@ def download_binary(url: str, destination: Path, timeout: int = 600) -> None:
         temp_path.unlink(missing_ok=True)
 
 
+class MaskArchive:
+    """Lazy accessor for the ARPIL masks packaged in ``data.tar.gz``.
+
+    Upstream ships every mask inside one gzip archive rather than as individual
+    downloadable files, so a per-frame HTTP fetch is impossible. The archive is
+    downloaded once, then members are extracted on demand and cached on disk.
+    Gzip cannot seek, so the member index is built with a single streaming pass.
+    """
+
+    def __init__(self, archive_path: Path, extract_dir: Path, logger=None) -> None:
+        self.archive_path = archive_path
+        self.extract_dir = ensure_dir(extract_dir)
+        self.logger = logger
+        self._members: dict[str, str] | None = None
+
+    def ensure_downloaded(self) -> None:
+        if self.archive_path.exists() and self.archive_path.stat().st_size > 0:
+            return
+        if self.logger:
+            self.logger.log(
+                "Downloading ARPIL mask archive data.tar.gz (~1.3 GB, one time)"
+            )
+        download_binary(MASK_ARCHIVE_URL, self.archive_path)
+
+    def _index(self) -> dict[str, str]:
+        if self._members is not None:
+            return self._members
+        self.ensure_downloaded()
+        if self.logger:
+            self.logger.log("Indexing mask archive (single streaming pass)")
+        members: dict[str, str] = {}
+        with tarfile.open(self.archive_path, "r:gz") as tar:
+            for name in tar.getnames():
+                if name.endswith(".h5"):
+                    members[Path(name).name] = name
+        self._members = members
+        if self.logger:
+            self.logger.debug(f"mask_archive_members={len(members)}")
+        return members
+
+    def extract(self, file_path: str) -> Path:
+        """Return a local path to the mask named by CSV ``file_path``."""
+        basename = Path(file_path).name
+        target = self.extract_dir / basename
+        if target.exists() and target.stat().st_size > 0:
+            return target
+        members = self._index()
+        member = members.get(basename)
+        if member is None:
+            raise RuntimeError(
+                f"Mask {basename} is not present in {self.archive_path.name}. "
+                "The upstream archive layout may have changed."
+            )
+        with tarfile.open(self.archive_path, "r:gz") as tar:
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                raise RuntimeError(f"Could not read {member} from the mask archive.")
+            temp_path = target.with_name(target.name + ".part")
+            with temp_path.open("wb") as handle:
+                shutil.copyfileobj(extracted, handle)
+            temp_path.replace(target)
+        return target
+
+    def available_basenames(self) -> set[str]:
+        return set(self._index())
+
+
 def normalize_core_key(path_value: str) -> str:
     path_value = path_value.strip()
     filename = Path(path_value).name
@@ -785,6 +859,9 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
             writer.writerow({"timestamp": item["timestamp"], "core_key": item["core"]["normalized_key"], "mask_path": item["mask"]["file_path"]})
 
     s3_client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+    mask_archive = MaskArchive(
+        download_cache / "data.tar.gz", mask_cache / "extracted", logger
+    )
     real_ids: list[str] = []
     provenance_rows: list[dict[str, str]] = []
     empty_counter = 0
@@ -794,12 +871,11 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
         core_key = item["core"]["normalized_key"]
         mask_rel = item["mask"]["file_path"]
         core_local = core_cache / core_key
-        mask_local = mask_cache / Path(mask_rel).name
         logger.log(f"[{frame_index}/{len(selected)}] fetching {timestamp}")
         logger.debug(f"core_s3_key={core_key} -> {core_local}")
-        logger.debug(f"mask_url={MASK_BASE_URL + mask_rel} -> {mask_local}")
+        logger.debug(f"mask_member={mask_rel}")
         download_core_s3(s3_client, core_key, core_local)
-        download_binary(MASK_BASE_URL + mask_rel, mask_local)
+        mask_local = mask_archive.extract(mask_rel)
 
         stack = read_core_stack(core_local, args.channels)
         mask_full = read_arpil_mask(mask_local, args.mask_key)[None]

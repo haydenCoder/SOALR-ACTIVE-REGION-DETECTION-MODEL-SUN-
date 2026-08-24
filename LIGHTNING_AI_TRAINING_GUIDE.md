@@ -19,11 +19,50 @@ It now supports:
 
 ## 1) Clone the branch in Lightning AI
 
+Open a Lightning AI Studio, then in its terminal:
+
 ```bash
 git clone https://github.com/haydenCoder/SOALR-ACTIVE-REGION-DETECTION-MODEL-SUN-.git
 cd SOALR-ACTIVE-REGION-DETECTION-MODEL-SUN-
-git fetch origin arena/01a02a48-soalr-active-region-detection
-git checkout arena/01a02a48-soalr-active-region-detection
+git fetch origin arena/01a03190-soalr-active-region-detection
+git checkout arena/01a03190-soalr-active-region-detection
+```
+
+Verify you are on the right commit and that the code is healthy before training:
+
+```bash
+git log --oneline -1
+pip install -r requirements.txt
+python -m pytest tests/ -q          # expect: 108 passed
+```
+
+## 1b) Where the data actually comes from
+
+Two separate sources, with different access methods. This matters because they
+fail in different ways:
+
+| Data | Host | Access | Size |
+| --- | --- | --- | --- |
+| ARPIL masks (`.h5`, `[2,4096,4096]`) | Hugging Face `surya-bench-ar-segmentation` | one `data.tar.gz`, extracted on demand | ~1.31 GB total |
+| Core SDO frames (`.nc`, 13 channels) | AWS S3 `s3://nasa-surya-bench` (unsigned) | per-frame `boto3` download | ~570 MB **per frame** |
+
+**The masks are not individually downloadable.** Upstream publishes only the CSV
+splits plus a single `data.tar.gz`; the `data/<year>/<month>/<stamp>.h5` paths in
+the CSV `file_path` column exist *inside* that archive. The plugin downloads the
+archive once into `<work-dir>/dataset/download_cache/` and extracts members as
+needed. Budget the 1.3 GB and the one-time index pass on first run.
+
+Frames are the expensive part: at ~570 MB each, `--max-frames 48` streams roughly
+27 GB. They are fetched to a temp/cache location, tiled, and the `.nc` is not
+kept, so peak disk stays modest — but the network transfer is real. Start with
+`--max-frames 4` to confirm the path works before committing to a long run.
+
+Check reachability from the Studio first; if either is blocked, use the
+SHARP fallback in section 3 instead:
+
+```bash
+curl -sI "https://huggingface.co/datasets/nasa-ibm-ai4science/surya-bench-ar-segmentation/resolve/main/train.csv" | head -1
+python -c "import boto3;from botocore import UNSIGNED;from botocore.config import Config;print(boto3.client('s3',config=Config(signature_version=UNSIGNED)).list_objects_v2(Bucket='nasa-surya-bench',MaxKeys=3).get('KeyCount'))"
 ```
 
 ---
@@ -40,6 +79,7 @@ This is the recommended run for your target setup:
 - 70% real / 30% synthetic
 - HDF5 tiles
 - 100 epochs
+- D4 test-time augmentation at validation
 - verbose logging
 - previews every 5 epochs
 - automatic resume if `last.pt` already exists
@@ -59,9 +99,11 @@ python3 solar_arpil_plugin.py \
   --keep-empty-every 32 \
   --val-ratio 0.15 \
   --cpu-threads 4 \
+  --memory-budget-gb 15 \
   --epochs 100 \
   --batch-size 2 \
   --grad-accumulation-steps 2 \
+  --tta d4 \
   --lr 3e-4 \
   --weight-decay 1e-4 \
   --base-channels 32 \
@@ -89,9 +131,11 @@ python3 solar_arpil_plugin.py \
   --tile-size 512 \
   --tile-stride 256 \
   --cpu-threads 4 \
+  --memory-budget-gb 15 \
   --epochs 100 \
   --batch-size 2 \
   --grad-accumulation-steps 2 \
+  --tta d4 \
   --base-channels 32 \
   --dropout 0.05 \
   --resume auto \
@@ -246,17 +290,37 @@ python3 solar_arpil_plugin.py \
 
 ## 12) Audit result
 
-The plugin was audited with:
-- Python syntax compilation,
-- dependency bootstrap check,
-- end-to-end smoke test in `sharp_sample` mode,
-- duplicate-ID audit,
-- resume/log/progress/preview/provenance file generation checks.
+Every non-README download URL in the repo was re-verified against the live hosts.
 
-Smoke test confirmed:
-- dataset built successfully,
-- provenance files written,
-- previews saved,
-- checkpoints saved,
-- progress file updated,
-- no duplicate sample IDs.
+| Endpoint | Verdict |
+| --- | --- |
+| `core-sdo/resolve/main/{train,val,test}.csv` | correct, present upstream |
+| ARPIL mask splits `{train,validation,test,leaky_validation}.csv` | correct, present upstream |
+| ARPIL per-frame `resolve/main/data/<y>/<m>/<stamp>.h5` | **broken — fixed** (see below) |
+| S3 `nasa-surya-bench` unsigned, key `<YYYY>/<MM>/<file>.nc` | bucket confirmed via AWS Open Data; key layout not reachable from the audit sandbox — validate with the `list_objects_v2` probe in section 1b |
+| `github.com/mbobra/SHARPs.git` | HTTP 200 |
+| `zenodo.org/records/7950721` (UAD helper script) | not reachable from the audit sandbox; unused by the main pipeline |
+
+**Bug found and fixed.** Both `solar_arpil_plugin.py` and
+`scripts/build_arpil_3ch_tiles.py` built mask URLs as
+`<repo>/resolve/main/` + the CSV `file_path`. The AR-segmentation repo root
+contains only `.gitattributes`, `README.md`, `data.tar.gz`, and the four CSVs —
+there is no `data/` tree — so *every* mask fetch returned 404 and no
+`arpil_sdo` run could ever have produced a real dataset. Both call sites now
+download `data.tar.gz` once, index it in a single streaming pass, and extract
+members on demand. `tests/test_mask_archive.py` covers indexing, extraction,
+caching, `.part` cleanup, missing-member errors, and download-skip behaviour.
+
+**Formats confirmed against the upstream dataset cards:** ARPIL masks are HDF5
+`[2, 4096, 4096]` at 1-hour cadence (May 2010 - Dec 2024); core-SDO frames are
+netCDF float32 `[13, 4096, 4096]` at 12-minute cadence. The plugin's default
+channels `aia171 aia193 hmi_m` are all in the 13-variable set.
+
+Verification run on this branch:
+
+```
+python -m pytest tests/ -q                      # 108 passed
+python -m pyflakes $(git ls-files '*.py')       # clean
+python3 solar_arpil_plugin.py --source-mode sharp_sample ... --epochs 1
+                                                # exit 0, val_dice=0.4801
+```
