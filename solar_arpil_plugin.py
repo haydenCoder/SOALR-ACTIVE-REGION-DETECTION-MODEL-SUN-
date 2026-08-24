@@ -281,7 +281,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-mode", choices=["arpil_sdo", "sharp_sample"], default="arpil_sdo")
     parser.add_argument("--work-dir", default="plugin_runs/arpil_plugin", help="Main output directory")
     parser.add_argument("--channels", nargs="+", default=DEFAULT_CHANNELS, help="3-channel stack for ARPIL/core-SDO mode")
-    parser.add_argument("--mask-split", choices=sorted(MASK_SPLIT_URLS), default="train")
+    parser.add_argument("--mask-split", choices=sorted(MASK_SPLIT_URLS), default="validation")
+    parser.add_argument(
+        "--pool-core-splits",
+        dest="pool_core_splits",
+        action="store_true",
+        default=True,
+        help="Search every core-SDO split CSV for a matching timestamp (default). "
+             "Core split names do not correspond to ARPIL split names.",
+    )
+    parser.add_argument(
+        "--no-pool-core-splits",
+        dest="pool_core_splits",
+        action="store_false",
+        help="Only use the core-SDO CSV whose name matches --mask-split.",
+    )
     parser.add_argument("--mask-key", default="union_with_intersect")
     parser.add_argument("--real-ratio", type=float, default=0.70)
     parser.add_argument("--synthetic-ratio", type=float, default=0.30)
@@ -566,6 +580,13 @@ def timestamp_key(path_value: str) -> str:
     return stem
 
 
+def _key_span(keys: list[str]) -> str:
+    """Human-readable first..last stamp for an error message."""
+    if not keys:
+        return "none"
+    return f"{keys[0]} .. {keys[-1]}"
+
+
 def align_arpil_and_core(mask_rows: list[dict[str, str]], core_rows: list[dict[str, str]]) -> list[dict[str, str]]:
     mask_map: dict[str, dict[str, str]] = {}
     for row in mask_rows:
@@ -588,13 +609,21 @@ def align_arpil_and_core(mask_rows: list[dict[str, str]], core_rows: list[dict[s
 
     timestamps = sorted(set(mask_map) & set(core_map))
     if not timestamps:
+        mask_keys = sorted(mask_map)
+        core_keys = sorted(core_map)
         raise RuntimeError(
             "No timestamps are common to the ARPIL mask index and the core-SDO index.\n"
             f"  mask rows usable: {len(mask_map)} (of {len(mask_rows)})\n"
+            f"  mask date range: {_key_span(mask_keys)}\n"
             f"  core rows usable: {len(core_map)} (of {len(core_rows)})\n"
-            f"  example mask keys: {sorted(mask_map)[:3]}\n"
-            f"  example core keys: {sorted(core_map)[:3]}\n"
-            "The index CSV layout may have changed upstream."
+            f"  core date range: {_key_span(core_keys)}\n"
+            f"  example mask keys: {mask_keys[:3]}\n"
+            f"  example core keys: {core_keys[:3]}\n"
+            "The two indices cover disjoint time windows. The core-SDO CSVs only "
+            "index January 2011, and each ARPIL split covers a different period, so "
+            "matching split names do NOT imply matching dates. Pass --pool-core-splits "
+            "(default) so every core split is searched, and pick a --mask-split whose "
+            "dates overlap January 2011 (validation covers 2011-01-15..2011-01-31)."
         )
     return [{"timestamp": ts, "mask": mask_map[ts], "core": core_map[ts]} for ts in timestamps]
 
@@ -841,9 +870,41 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
 
     logger.log(f"Downloading ARPIL split CSV: {args.mask_split}")
     mask_rows = read_csv_from_text(download_text(MASK_SPLIT_URLS[args.mask_split]))
-    logger.log(f"Downloading core-SDO index CSV: {args.mask_split}")
-    core_rows = read_csv_from_text(download_text(CORE_INDEX_URLS[args.mask_split]))
+
+    # The ARPIL and core-SDO repos use the same split NAMES for different date
+    # windows: every core-SDO CSV indexes January 2011 only, while ARPIL "train"
+    # skips January 2011 entirely (…2010-12-31, then 2011-02-15…). Pairing split
+    # to split therefore yields an empty intersection. The core splits are random
+    # shuffles of one month, so pooling them restores full coverage.
+    core_rows: list[dict[str, str]] = []
+    if getattr(args, "pool_core_splits", True):
+        seen_core: set[str] = set()
+        for split_name in sorted(CORE_INDEX_URLS):
+            logger.log(f"Downloading core-SDO index CSV: {split_name}")
+            try:
+                rows = read_csv_from_text(download_text(CORE_INDEX_URLS[split_name]))
+            except Exception as exc:  # a single missing split must not be fatal
+                logger.log(f"  core split {split_name} unavailable: {exc}")
+                continue
+            added = 0
+            for row in rows:
+                raw_path = row.get("path") or row.get("file_path") or ""
+                if not raw_path or raw_path in seen_core:
+                    continue
+                seen_core.add(raw_path)
+                core_rows.append(row)
+                added += 1
+            logger.debug(f"core_split={split_name} rows={len(rows)} new={added}")
+        logger.log(f"Pooled core-SDO index rows: {len(core_rows)}")
+    else:
+        logger.log(f"Downloading core-SDO index CSV: {args.mask_split}")
+        core_rows = read_csv_from_text(download_text(CORE_INDEX_URLS[args.mask_split]))
+
     aligned = align_arpil_and_core(mask_rows, core_rows)
+    logger.log(
+        f"Aligned {len(aligned)} frames "
+        f"({aligned[0]['timestamp']} .. {aligned[-1]['timestamp']})"
+    )
     if not aligned:
         raise RuntimeError("No aligned ARPIL/core-SDO timestamps were found.")
 

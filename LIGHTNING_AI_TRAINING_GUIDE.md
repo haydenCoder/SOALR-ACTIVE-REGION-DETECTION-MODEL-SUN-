@@ -95,6 +95,33 @@ curl -sI "https://huggingface.co/datasets/nasa-ibm-ai4science/surya-bench-ar-seg
 python -c "import boto3;from botocore import UNSIGNED;from botocore.config import Config;print(boto3.client('s3',config=Config(signature_version=UNSIGNED)).list_objects_v2(Bucket='nasa-surya-bench',MaxKeys=3).get('KeyCount'))"
 ```
 
+### Split names are a trap: the two repos do not line up
+
+The ARPIL mask repo and the core-SDO repo both have `train` / `validation` / `test`
+splits, but they cover **completely different date windows**:
+
+| Index | Cadence | Dates covered |
+|---|---|---|
+| ARPIL mask `train` | hourly | 2010-05-13 → 2019-07-20, **but January 2011 is missing** (…2010-12-31 23:00, then 2011-02-15 00:00…) |
+| ARPIL mask `validation` | hourly | 2011-01-15 → 2011-01-31, then 2012-01-15…, one mid-January slice per year |
+| ARPIL mask `test` | hourly | 2020-01-01 → … |
+| core-SDO `train` / `val` / `test` | 12 minutes | **January 2011 only** — all three are random shuffles of the same month |
+
+Two consequences:
+
+1. **`--mask-split train` cannot work.** ARPIL `train` skips exactly the one month
+   core-SDO indexes, so the timestamp intersection is empty and the run dies with
+   `No timestamps are common to the ARPIL mask index and the core-SDO index`.
+   The guide now defaults to `--mask-split validation`, which overlaps Jan 2011.
+2. **Core splits must be pooled.** Because the core splits are random shuffles of
+   one month, no single core CSV holds every hour. The plugin now downloads all
+   of them and merges by filename (`--pool-core-splits`, on by default). Use
+   `--no-pool-core-splits` to restore the old split-to-split behaviour.
+
+Only exact-hour core frames pair with the hourly masks (`_0000`, `_0100`, …); the
+`_0012` / `_0024` / `_0036` frames in between have no mask and are skipped. That is
+expected, not an error — a full January gives roughly 744 usable pairs.
+
 ---
 
 ## 2) Main training command
@@ -119,7 +146,7 @@ python3 solar_arpil_plugin.py \
   --source-mode arpil_sdo \
   --work-dir plugin_runs/arpil_plugin \
   --channels aia171 aia193 hmi_m \
-  --mask-split train \
+  --mask-split validation \
   --real-ratio 0.70 \
   --synthetic-ratio 0.30 \
   --max-frames 48 \

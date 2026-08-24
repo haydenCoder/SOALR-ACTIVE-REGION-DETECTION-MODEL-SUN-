@@ -168,3 +168,36 @@ def test_bootstrap_without_auto_install_names_packages(monkeypatch: pytest.Monke
     message = str(excinfo.value)
     assert "h5py" in message and "netCDF4" in message
     assert "pip install" in message
+
+
+def test_align_matches_hourly_masks_to_exact_hour_core_frames():
+    """Core CSVs are 12-minute cadence; only the :00 frames can pair with hourly masks."""
+    plugin = pytest.importorskip("solar_arpil_plugin")
+    mask_rows = [
+        {"timestamp": "2011-01-15 00:00:00", "file_path": "data/2011/01/20110115_0000.h5", "present": "1.0"},
+        {"timestamp": "2011-01-15 01:00:00", "file_path": "data/2011/01/20110115_0100.h5", "present": "1.0"},
+    ]
+    core_rows = [
+        {"path": "20110115_0000.nc", "timestep": "1/15/11 00:00", "present": "1"},
+        {"path": "20110115_0012.nc", "timestep": "1/15/11 00:12", "present": "1"},
+        {"path": "20110115_0100.nc", "timestep": "1/15/11 01:00", "present": "1"},
+    ]
+    aligned = plugin.align_arpil_and_core(mask_rows, core_rows)
+    assert [item["timestamp"] for item in aligned] == ["20110115_0000", "20110115_0100"]
+    assert aligned[0]["core"]["normalized_key"] == "2011/01/20110115_0000.nc"
+
+
+def test_align_reports_date_ranges_when_windows_are_disjoint():
+    """ARPIL train skips Jan 2011 while core-SDO only covers Jan 2011."""
+    plugin = pytest.importorskip("solar_arpil_plugin")
+    mask_rows = [
+        {"file_path": "data/2010/12/20101231_2300.h5", "present": "1.0"},
+        {"file_path": "data/2011/02/20110215_0000.h5", "present": "1.0"},
+    ]
+    core_rows = [{"path": "20110115_0000.nc", "present": "1"}]
+    with pytest.raises(RuntimeError) as excinfo:
+        plugin.align_arpil_and_core(mask_rows, core_rows)
+    message = str(excinfo.value)
+    assert "mask date range: 20101231_2300 .. 20110215_0000" in message
+    assert "core date range: 20110115_0000 .. 20110115_0000" in message
+    assert "disjoint time windows" in message
