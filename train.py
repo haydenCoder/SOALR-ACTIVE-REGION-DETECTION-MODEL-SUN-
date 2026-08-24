@@ -289,6 +289,7 @@ def main() -> None:
         warmup_epochs=args.warmup_epochs,
         tta=args.tta,
         channels_last=args.channels_last,
+        resume=args.resume,
     )
     trainer.fit()
 

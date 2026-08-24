@@ -263,9 +263,11 @@ class Trainer:
         warmup_epochs: int = 1,
         tta: str = "none",
         channels_last: bool = True,
+        resume: bool = False,
     ) -> None:
         seed_everything(seed)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.resume = resume
 
         # Detect and claim the CPU/RAM budget before building anything heavy.
         self.resource_plan = configure_runtime(
@@ -414,10 +416,21 @@ class Trainer:
             json.dump(payload, handle, indent=2, default=str)
 
     def fit(self) -> None:
+        start_epoch = 1
         best_score = -math.inf
         epochs_without_improvement = 0
 
-        for epoch in range(1, self.epochs + 1):
+        if self.resume and self.last_checkpoint_path.exists():
+            print(f"Resuming from checkpoint: {self.last_checkpoint_path}")
+            checkpoint = torch.load(self.last_checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            start_epoch = checkpoint["metrics"]["epoch"] + 1
+            best_score = checkpoint["metrics"].get("val_dice", -math.inf)
+            print(f"Starting from epoch {start_epoch}")
+
+        for epoch in range(start_epoch, self.epochs + 1):
             start = perf_counter()
             train_loss = self._run_epoch(epoch, training=True)
             train_seconds = perf_counter() - start
