@@ -286,7 +286,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-mask-fraction", type=float, default=0.0025)
     parser.add_argument("--keep-empty-every", type=int, default=32)
     parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=4,
+        help="Target CPU cores to saturate; clamped to the cores actually available",
+    )
+    parser.add_argument(
+        "--memory-budget-gb",
+        type=float,
+        default=15.0,
+        help="Target RAM in GB, used to size the in-RAM tile cache; clamped to detected RAM",
+    )
+    parser.add_argument(
+        "--tta",
+        choices=["none", "flips", "d4"],
+        default="none",
+        help="Test-time augmentation for validation and previews",
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accumulation-steps", type=int, default=2)
@@ -311,9 +328,20 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def set_cpu_runtime(cpu_threads: int) -> None:
-    torch.set_num_threads(cpu_threads)
-    torch.set_num_interop_threads(1)
+def set_cpu_runtime(cpu_threads: int, memory_budget_gb: float = 0.0):
+    """Claim the CPU/RAM budget, clamped to what the machine actually has.
+
+    Returns the resolved :class:`~solar_ar.runtime.ResourcePlan` so the caller
+    can size DataLoader workers and the sample cache consistently.
+    """
+    from solar_ar.runtime import configure_runtime
+
+    plan = configure_runtime(
+        cpu_budget=cpu_threads,
+        memory_budget_gb=memory_budget_gb,
+        use_cuda=torch.cuda.is_available(),
+    )
+    return plan
 
 
 #: Marker that starts every Git LFS pointer file. Hugging Face's ``raw/`` endpoint
@@ -1183,7 +1211,7 @@ def maybe_load_checkpoint(model, optimizer, scheduler, checkpoint_path: Path, me
     return start_epoch, best_metrics
 
 
-def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logger: Logger) -> None:
+def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logger: Logger, resource_plan=None) -> None:
     manifest_path = dataset_dir / "manifest.csv"
     train_dataset = H5TileDataset(manifest_path, split="train", augment=True, seed=args.seed)
     val_dataset = H5TileDataset(manifest_path, split="val", augment=False, seed=args.seed)
@@ -1192,10 +1220,27 @@ def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logg
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.log(f"Device: {device}")
-    logger.log(f"CPU threads: {args.cpu_threads}")
+    plan = resource_plan
+    if plan is not None:
+        logger.log(plan.describe())
+        # An explicit --num-workers wins; otherwise take the planned value.
+        workers = args.num_workers if args.num_workers > 0 else plan.dataloader_workers
+        pin_memory = plan.pin_memory
+    else:
+        logger.log(f"CPU threads: {args.cpu_threads}")
+        workers = args.num_workers
+        pin_memory = False
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, drop_last=False)
+    loader_kwargs = {
+        "num_workers": workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": workers > 0,
+    }
+    if workers > 0:
+        loader_kwargs["prefetch_factor"] = 4
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, **loader_kwargs)
 
     in_channels = 3
     model = AttentionUNet(in_channels=in_channels, out_channels=1, base_channels=args.base_channels, dropout=args.dropout).to(device)
@@ -1238,9 +1283,17 @@ def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logg
             for images, masks in val_loader:
                 images = images.to(device)
                 masks = masks.to(device)
-                with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
-                    logits = model(images)
+                if args.tta != "none":
+                    # Average over the D4 symmetries, then convert back to a
+                    # logit so the existing loss and metrics still apply.
+                    from solar_ar.tta import tta_predict
+
+                    logits = tta_predict(model, images, transforms=args.tta, return_logits=True)
                     loss = criterion(logits, masks)
+                else:
+                    with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
+                        logits = model(images)
+                        loss = criterion(logits, masks)
                 dice, iou = segmentation_metrics(logits, masks)
                 val_loss_total += float(loss.item())
                 val_dice_total += dice
@@ -1304,7 +1357,9 @@ def main() -> None:
     if args.no_auto_install_deps and any(importlib.util.find_spec(m) is None for m in REQUIRED_IMPORTS):
         raise RuntimeError("Required dependencies are missing and --no-auto-install-deps was requested.")
     seed_everything(args.seed)
-    set_cpu_runtime(args.cpu_threads)
+    # Kept out of `args` so that vars(args) stays JSON-serializable for
+    # run_config.json; passed explicitly to the training entry point instead.
+    resource_plan = set_cpu_runtime(args.cpu_threads, args.memory_budget_gb)
 
     work_dir = ensure_dir(Path(args.work_dir))
     dataset_dir = ensure_dir(work_dir / "dataset")
@@ -1328,7 +1383,7 @@ def main() -> None:
         logger.log(
             f"Dataset audit: total={audit['total']} train={audit['train']} val={audit['val']} synthetic_train={audit['synthetic_train']}"
         )
-        train_model(args, dataset_dir, run_dir, logger)
+        train_model(args, dataset_dir, run_dir, logger, resource_plan)
         logger.log("Training finished.")
     finally:
         logger.close()
