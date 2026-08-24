@@ -5,9 +5,10 @@ import argparse
 import csv
 import os
 import random
+import tarfile
+import shutil
 import tempfile
 from pathlib import Path
-from typing import Iterable
 
 import boto3
 import h5py
@@ -24,6 +25,7 @@ MASK_SPLIT_URLS = {
     "leaky_validation": "https://huggingface.co/datasets/nasa-ibm-ai4science/surya-bench-ar-segmentation/raw/main/leaky_validation.csv",
 }
 MASK_BASE_URL = "https://huggingface.co/datasets/nasa-ibm-ai4science/surya-bench-ar-segmentation/resolve/main/"
+MASK_ARCHIVE_URL = MASK_BASE_URL + "data.tar.gz?download=true"
 CORE_BUCKET = "nasa-surya-bench"
 DEFAULT_CHANNELS = ["aia171", "aia193", "hmi_m"]
 
@@ -62,14 +64,51 @@ def read_csv_rows(url: str) -> list[dict[str, str]]:
     return list(csv.DictReader(response.text.splitlines()))
 
 
-def download_mask(mask_rel_path: str, destination: Path) -> None:
-    url = MASK_BASE_URL + mask_rel_path
-    with requests.get(url, stream=True, timeout=300) as response:
+def download_mask_archive(destination: Path) -> None:
+    """Fetch the one-and-only mask archive published upstream.
+
+    The AR-segmentation repo does not serve per-frame .h5 files; its root holds
+    the CSV splits plus a single data.tar.gz. Fetching MASK_BASE_URL + file_path
+    returns 404, so the archive must be pulled once and read member-by-member.
+    """
+    if destination.exists() and destination.stat().st_size > 0:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_name(destination.name + ".part")
+    print(f"Downloading mask archive (~1.3 GB, one time) -> {destination}")
+    with requests.get(MASK_ARCHIVE_URL, stream=True, timeout=1800) as response:
         response.raise_for_status()
-        with destination.open("wb") as handle:
+        with temp_path.open("wb") as handle:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     handle.write(chunk)
+    temp_path.replace(destination)
+
+
+def index_mask_archive(archive_path: Path) -> dict[str, str]:
+    """Map mask basename -> tar member name in one streaming pass."""
+    members: dict[str, str] = {}
+    with tarfile.open(archive_path, "r:gz") as tar:
+        for name in tar.getnames():
+            if name.endswith(".h5"):
+                members[Path(name).name] = name
+    return members
+
+
+def extract_mask(archive_path: Path, members: dict[str, str], mask_rel_path: str, destination: Path) -> None:
+    basename = Path(mask_rel_path).name
+    member = members.get(basename)
+    if member is None:
+        raise SystemExit(
+            f"Mask {basename} is missing from {archive_path.name}; "
+            "the upstream archive layout may have changed."
+        )
+    with tarfile.open(archive_path, "r:gz") as tar:
+        source = tar.extractfile(member)
+        if source is None:
+            raise SystemExit(f"Could not read {member} from the mask archive.")
+        with destination.open("wb") as handle:
+            shutil.copyfileobj(source, handle)
 
 
 def download_core_s3(s3_client, key: str, destination: Path) -> None:
@@ -131,6 +170,11 @@ def main() -> None:
     empty_counter = 0
     kept_tiles = 0
 
+    archive_path = output_dir / "download_cache" / "data.tar.gz"
+    download_mask_archive(archive_path)
+    mask_members = index_mask_archive(archive_path)
+    print(f"Mask archive indexed: {len(mask_members)} frames")
+
     with tempfile.TemporaryDirectory(prefix="arpil_stream_") as tmpdir:
         tmpdir_path = Path(tmpdir)
         for frame_idx, row in enumerate(rows, start=1):
@@ -142,7 +186,7 @@ def main() -> None:
 
             print(f"[{frame_idx}/{len(rows)}] downloading core={core_key} mask={mask_rel_path}")
             download_core_s3(s3_client, core_key, nc_path)
-            download_mask(mask_rel_path, h5_path)
+            extract_mask(archive_path, mask_members, mask_rel_path, h5_path)
 
             image_stack = load_core_channels(nc_path, args.channels)
             mask = load_mask(h5_path, args.mask_key)

@@ -27,13 +27,22 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from time import perf_counter
+
+# Share the array/HDF5 readers with the training package so both understand the
+# same file layouts and dataset-key conventions. The actual import happens in
+# load_runtime_modules(), after dependencies are guaranteed to be installed --
+# solar_ar.arrayio imports numpy at module scope.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 # CPU-oriented defaults. Users can still override via env or CLI.
 os.environ.setdefault("OMP_NUM_THREADS", "4")
@@ -67,6 +76,12 @@ CORE_INDEX_URLS = {
     "leaky_validation": "https://huggingface.co/datasets/nasa-ibm-ai4science/core-sdo/resolve/main/val.csv?download=true",
 }
 MASK_BASE_URL = "https://huggingface.co/datasets/nasa-ibm-ai4science/surya-bench-ar-segmentation/resolve/main/"
+# The AR-segmentation repo does NOT expose the per-frame .h5 files individually:
+# its root holds only the CSV splits plus a single data.tar.gz (~1.31 GB) that
+# expands to the data/<year>/<month>/<stamp>.h5 tree the CSV "file_path" column
+# refers to. Requesting MASK_BASE_URL + file_path therefore 404s. We download the
+# archive once and extract frames from it on demand.
+MASK_ARCHIVE_URL = MASK_BASE_URL + "data.tar.gz?download=true"
 CORE_BUCKET = "nasa-surya-bench"
 DEFAULT_CHANNELS = ["aia171", "aia193", "hmi_m"]
 SHARP_SAMPLE_REPO = "https://github.com/mbobra/SHARPs.git"
@@ -95,6 +110,7 @@ DataLoader = None
 Dataset = None
 Image = None
 ImageOps = None
+load_array = None
 
 
 @dataclass
@@ -133,26 +149,98 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def _pip_install(arguments: list[str]) -> subprocess.CompletedProcess:
+    """Run pip, retrying with --break-system-packages on PEP 668 environments.
+
+    Debian/Ubuntu mark their system Python "externally managed", so a plain
+    ``pip install`` aborts with error: externally-managed-environment. Retrying
+    with the escape hatch keeps the plugin usable on those images without
+    forcing the caller to build a virtualenv first.
+    """
+    command = [sys.executable, "-m", "pip", "install", *arguments]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result
+
+    output = f"{result.stdout}\n{result.stderr}"
+    if "externally-managed-environment" in output or "externally managed" in output:
+        print("Externally managed environment detected; retrying with --break-system-packages", flush=True)
+        result = subprocess.run([*command, "--break-system-packages"], capture_output=True, text=True)
+        if result.returncode == 0:
+            return result
+        output = f"{result.stdout}\n{result.stderr}"
+
+    raise RuntimeError(
+        "Dependency installation failed.\n"
+        f"  command: {' '.join(command)}\n"
+        f"  exit code: {result.returncode}\n"
+        f"{output.strip()[-1500:]}\n\n"
+        "Install the requirements manually, then re-run with SOLAR_PLUGIN_NO_AUTO_INSTALL=1:\n"
+        f"  {sys.executable} -m pip install -r requirements.txt"
+    )
+
+
+def missing_dependencies() -> list[str]:
+    """Return the pip package names whose import modules are not importable."""
+    return sorted(
+        {pkg for module, pkg in REQUIRED_IMPORTS.items() if importlib.util.find_spec(module) is None}
+    )
+
+
 def bootstrap_dependencies(requirements_path: Path, auto_install: bool = True) -> None:
-    missing = [pkg for module, pkg in REQUIRED_IMPORTS.items() if importlib.util.find_spec(module) is None]
+    missing = missing_dependencies()
     if not missing:
         return
+
     if not auto_install:
-        raise RuntimeError(f"Missing Python packages: {missing}. Install requirements first.")
+        raise RuntimeError(
+            f"Missing Python packages: {missing}\n"
+            "Auto-install is disabled (SOLAR_PLUGIN_NO_AUTO_INSTALL=1). Install them with:\n"
+            f"  {sys.executable} -m pip install -r requirements.txt"
+        )
 
     print(f"Missing packages detected: {missing}", flush=True)
     if requirements_path.exists():
         print(f"Installing dependencies from {requirements_path} ...", flush=True)
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(requirements_path)], check=True)
+        _pip_install(["-r", str(requirements_path)])
     else:
         print("requirements.txt not found, installing fallback package list...", flush=True)
-        subprocess.run([sys.executable, "-m", "pip", "install", *sorted(set(missing))], check=True)
+        _pip_install(missing)
 
     importlib.invalidate_caches()
 
+    still_missing = missing_dependencies()
+    if still_missing:
+        raise RuntimeError(
+            f"These packages are still unimportable after installation: {still_missing}. "
+            "The install may have targeted a different interpreter than "
+            f"{sys.executable}."
+        )
+
 
 def load_runtime_modules() -> None:
-    global boto3, h5py, np, requests, torch, F, fits, UNSIGNED, Config, NetCDFDataset, nn, DataLoader, Dataset, Image, ImageOps
+    """Import every third-party module into this module's globals.
+
+    Everything below is imported lazily because the plugin may need to install
+    its own dependencies first. If an import fails we raise immediately with the
+    package name, otherwise the globals stay ``None`` and the failure surfaces
+    much later as a confusing ``NameError: name 'np' is not defined``.
+    """
+    try:
+        _import_runtime_modules()
+    except ImportError as exc:
+        module_name = getattr(exc, "name", None) or "a required module"
+        package = REQUIRED_IMPORTS.get(module_name, module_name)
+        raise RuntimeError(
+            f"Failed to import {module_name!r}, which is required to run this plugin.\n"
+            f"Install it with: {sys.executable} -m pip install {package}\n"
+            f"Or install everything with: {sys.executable} -m pip install -r requirements.txt\n"
+            f"Original error: {exc}"
+        ) from exc
+
+
+def _import_runtime_modules() -> None:
+    global boto3, h5py, np, requests, torch, F, fits, UNSIGNED, Config, NetCDFDataset, nn, DataLoader, Dataset, Image, ImageOps, load_array
     import boto3 as _boto3
     import h5py as _h5py
     import numpy as _np
@@ -183,13 +271,31 @@ def load_runtime_modules() -> None:
     Image = _Image
     ImageOps = _ImageOps
 
+    from solar_ar.arrayio import load_array as _load_array
+
+    load_array = _load_array
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="All-in-one ARPIL/SDO training plugin")
     parser.add_argument("--source-mode", choices=["arpil_sdo", "sharp_sample"], default="arpil_sdo")
     parser.add_argument("--work-dir", default="plugin_runs/arpil_plugin", help="Main output directory")
     parser.add_argument("--channels", nargs="+", default=DEFAULT_CHANNELS, help="3-channel stack for ARPIL/core-SDO mode")
-    parser.add_argument("--mask-split", choices=sorted(MASK_SPLIT_URLS), default="train")
+    parser.add_argument("--mask-split", choices=sorted(MASK_SPLIT_URLS), default="validation")
+    parser.add_argument(
+        "--pool-core-splits",
+        dest="pool_core_splits",
+        action="store_true",
+        default=True,
+        help="Search every core-SDO split CSV for a matching timestamp (default). "
+             "Core split names do not correspond to ARPIL split names.",
+    )
+    parser.add_argument(
+        "--no-pool-core-splits",
+        dest="pool_core_splits",
+        action="store_false",
+        help="Only use the core-SDO CSV whose name matches --mask-split.",
+    )
     parser.add_argument("--mask-key", default="union_with_intersect")
     parser.add_argument("--real-ratio", type=float, default=0.70)
     parser.add_argument("--synthetic-ratio", type=float, default=0.30)
@@ -201,7 +307,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-mask-fraction", type=float, default=0.0025)
     parser.add_argument("--keep-empty-every", type=int, default=32)
     parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=4,
+        help="Target CPU cores to saturate; clamped to the cores actually available",
+    )
+    parser.add_argument(
+        "--memory-budget-gb",
+        type=float,
+        default=15.0,
+        help="Target RAM in GB, used to size the in-RAM tile cache; clamped to detected RAM",
+    )
+    parser.add_argument(
+        "--tta",
+        choices=["none", "flips", "d4"],
+        default="none",
+        help="Test-time augmentation for validation and previews",
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accumulation-steps", type=int, default=2)
@@ -226,27 +349,178 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def set_cpu_runtime(cpu_threads: int) -> None:
-    torch.set_num_threads(cpu_threads)
-    torch.set_num_interop_threads(1)
+def set_cpu_runtime(cpu_threads: int, memory_budget_gb: float = 0.0):
+    """Claim the CPU/RAM budget, clamped to what the machine actually has.
+
+    Returns the resolved :class:`~solar_ar.runtime.ResourcePlan` so the caller
+    can size DataLoader workers and the sample cache consistently.
+    """
+    from solar_ar.runtime import configure_runtime
+
+    plan = configure_runtime(
+        cpu_budget=cpu_threads,
+        memory_budget_gb=memory_budget_gb,
+        use_cuda=torch.cuda.is_available(),
+    )
+    return plan
+
+
+#: Marker that starts every Git LFS pointer file. Hugging Face's ``raw/`` endpoint
+#: serves these instead of the real content for LFS-tracked files, which would
+#: otherwise be parsed as a one-row CSV of garbage.
+_LFS_POINTER_PREFIX = "version https://git-lfs.github.com/spec/v1"
+
+
+def _request_with_retries(
+    url: str,
+    *,
+    timeout: int,
+    stream: bool = False,
+    attempts: int = 4,
+):
+    """GET ``url``, retrying transient failures with exponential backoff.
+
+    Large public datasets routinely return 429/5xx or drop the connection
+    mid-transfer; without retries a multi-hour build dies on one blip.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, timeout=timeout, stream=stream)
+            if response.status_code in {429, 500, 502, 503, 504}:
+                raise RuntimeError(f"HTTP {response.status_code} from {url}")
+            response.raise_for_status()
+            return response
+        except Exception as exc:  # noqa: BLE001 - retry on any transport failure
+            last_error = exc
+            if attempt == attempts:
+                break
+            delay = min(2 ** attempt, 30)
+            print(f"  request failed ({exc}); retry {attempt}/{attempts - 1} in {delay}s", flush=True)
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"Failed to download {url} after {attempts} attempts. Last error: {last_error}\n"
+        "If this host is unreachable from your network, pre-download the data and use "
+        "--source-mode sharp_sample or the offline scripts in scripts/."
+    ) from last_error
 
 
 def download_text(url: str, timeout: int = 300) -> str:
-    response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.text
+    response = _request_with_retries(url, timeout=timeout)
+    text = response.text
+
+    if text.lstrip().startswith(_LFS_POINTER_PREFIX):
+        # Retry through the resolve/ endpoint, which streams real content.
+        resolved = url.replace("/raw/", "/resolve/")
+        if resolved != url:
+            print(f"  {url} returned a Git LFS pointer; retrying via {resolved}", flush=True)
+            text = _request_with_retries(resolved, timeout=timeout).text
+        if text.lstrip().startswith(_LFS_POINTER_PREFIX):
+            raise RuntimeError(
+                f"{url} returned a Git LFS pointer rather than file content. "
+                "Use the '/resolve/main/' URL form for LFS-tracked files."
+            )
+    return text
 
 
 def download_binary(url: str, destination: Path, timeout: int = 600) -> None:
-    if destination.exists():
+    """Stream ``url`` to ``destination``, atomically and idempotently.
+
+    Downloads land in a ``.part`` file that is renamed only on success, so an
+    interrupted run cannot leave a truncated file that later looks complete.
+    """
+    if destination.exists() and destination.stat().st_size > 0:
         return
     ensure_dir(destination.parent)
-    with requests.get(url, stream=True, timeout=timeout) as response:
-        response.raise_for_status()
-        with destination.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    handle.write(chunk)
+    temp_path = destination.with_name(destination.name + ".part")
+
+    try:
+        with _request_with_retries(url, timeout=timeout, stream=True) as response:
+            with temp_path.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+
+        if temp_path.stat().st_size == 0:
+            raise RuntimeError(f"Downloaded an empty file from {url}")
+
+        with temp_path.open("rb") as handle:
+            if handle.read(len(_LFS_POINTER_PREFIX)).decode("utf-8", "ignore") == _LFS_POINTER_PREFIX:
+                raise RuntimeError(
+                    f"{url} returned a Git LFS pointer rather than file content. "
+                    "Use the '/resolve/main/' URL form for LFS-tracked files."
+                )
+        temp_path.replace(destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+class MaskArchive:
+    """Lazy accessor for the ARPIL masks packaged in ``data.tar.gz``.
+
+    Upstream ships every mask inside one gzip archive rather than as individual
+    downloadable files, so a per-frame HTTP fetch is impossible. The archive is
+    downloaded once, then members are extracted on demand and cached on disk.
+    Gzip cannot seek, so the member index is built with a single streaming pass.
+    """
+
+    def __init__(self, archive_path: Path, extract_dir: Path, logger=None) -> None:
+        self.archive_path = archive_path
+        self.extract_dir = ensure_dir(extract_dir)
+        self.logger = logger
+        self._members: dict[str, str] | None = None
+
+    def ensure_downloaded(self) -> None:
+        if self.archive_path.exists() and self.archive_path.stat().st_size > 0:
+            return
+        if self.logger:
+            self.logger.log(
+                "Downloading ARPIL mask archive data.tar.gz (~1.3 GB, one time)"
+            )
+        download_binary(MASK_ARCHIVE_URL, self.archive_path)
+
+    def _index(self) -> dict[str, str]:
+        if self._members is not None:
+            return self._members
+        self.ensure_downloaded()
+        if self.logger:
+            self.logger.log("Indexing mask archive (single streaming pass)")
+        members: dict[str, str] = {}
+        with tarfile.open(self.archive_path, "r:gz") as tar:
+            for name in tar.getnames():
+                if name.endswith(".h5"):
+                    members[Path(name).name] = name
+        self._members = members
+        if self.logger:
+            self.logger.debug(f"mask_archive_members={len(members)}")
+        return members
+
+    def extract(self, file_path: str) -> Path:
+        """Return a local path to the mask named by CSV ``file_path``."""
+        basename = Path(file_path).name
+        target = self.extract_dir / basename
+        if target.exists() and target.stat().st_size > 0:
+            return target
+        members = self._index()
+        member = members.get(basename)
+        if member is None:
+            raise RuntimeError(
+                f"Mask {basename} is not present in {self.archive_path.name}. "
+                "The upstream archive layout may have changed."
+            )
+        with tarfile.open(self.archive_path, "r:gz") as tar:
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                raise RuntimeError(f"Could not read {member} from the mask archive.")
+            temp_path = target.with_name(target.name + ".part")
+            with temp_path.open("wb") as handle:
+                shutil.copyfileobj(extracted, handle)
+            temp_path.replace(target)
+        return target
+
+    def available_basenames(self) -> set[str]:
+        return set(self._index())
 
 
 def normalize_core_key(path_value: str) -> str:
@@ -261,27 +535,96 @@ def normalize_core_key(path_value: str) -> str:
 
 
 def read_csv_from_text(text: str) -> list[dict[str, str]]:
-    return list(csv.DictReader(text.splitlines()))
+    rows = list(csv.DictReader(text.splitlines()))
+    if not rows:
+        raise RuntimeError(
+            "Index CSV parsed to zero rows. The download may have returned an error page "
+            "or a Git LFS pointer instead of the real file."
+        )
+    return rows
+
+
+#: Cell values that mean "this frame is not available".
+_ABSENT_VALUES = {"", "0", "0.0", "false", "no", "nan", "none"}
+
+
+def is_present(row: dict[str, str]) -> bool:
+    """Return True unless the row explicitly marks the frame as absent.
+
+    Older index CSVs have no ``present`` column at all. Defaulting a missing
+    column to "absent" silently discarded every row and surfaced as a confusing
+    "no aligned timestamps" error, so an absent column now means "keep".
+    """
+    if "present" not in row:
+        return True
+    value = row.get("present")
+    if value is None:
+        return True
+    return str(value).strip().lower() not in _ABSENT_VALUES
+
+
+def timestamp_key(path_value: str) -> str:
+    """Extract the ``YYYYMMDD_HHMM`` stamp that links a mask to its core frame.
+
+    Falls back to the bare filename stem when no stamp is present so unusual
+    naming still matches instead of silently dropping the pair.
+    """
+    stem = Path(str(path_value)).name
+    for suffix in (".h5", ".hdf5", ".nc", ".nc4", ".npz", ".npy"):
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    match = re.search(r"(\d{8}[_T]?\d{4,6})", stem)
+    if match:
+        return match.group(1).replace("T", "_")
+    return stem
+
+
+def _key_span(keys: list[str]) -> str:
+    """Human-readable first..last stamp for an error message."""
+    if not keys:
+        return "none"
+    return f"{keys[0]} .. {keys[-1]}"
 
 
 def align_arpil_and_core(mask_rows: list[dict[str, str]], core_rows: list[dict[str, str]]) -> list[dict[str, str]]:
     mask_map: dict[str, dict[str, str]] = {}
     for row in mask_rows:
-        if row.get("present", "0") in {"0", "0.0", "", None}:
+        if not is_present(row):
             continue
-        mask_path = row.get("file_path", "")
+        mask_path = row.get("file_path") or row.get("path") or ""
         if not mask_path:
             continue
-        mask_map[Path(mask_path).stem] = row
+        mask_map[timestamp_key(mask_path)] = row
 
     core_map: dict[str, dict[str, str]] = {}
     for row in core_rows:
-        if row.get("present", "1") in {"0", "0.0", "", None}:
+        if not is_present(row):
             continue
-        key = normalize_core_key(row["path"])
-        core_map[Path(key).stem] = {**row, "normalized_key": key}
+        raw_path = row.get("path") or row.get("file_path") or ""
+        if not raw_path:
+            continue
+        key = normalize_core_key(raw_path)
+        core_map[timestamp_key(key)] = {**row, "normalized_key": key}
 
     timestamps = sorted(set(mask_map) & set(core_map))
+    if not timestamps:
+        mask_keys = sorted(mask_map)
+        core_keys = sorted(core_map)
+        raise RuntimeError(
+            "No timestamps are common to the ARPIL mask index and the core-SDO index.\n"
+            f"  mask rows usable: {len(mask_map)} (of {len(mask_rows)})\n"
+            f"  mask date range: {_key_span(mask_keys)}\n"
+            f"  core rows usable: {len(core_map)} (of {len(core_rows)})\n"
+            f"  core date range: {_key_span(core_keys)}\n"
+            f"  example mask keys: {mask_keys[:3]}\n"
+            f"  example core keys: {core_keys[:3]}\n"
+            "The two indices cover disjoint time windows. The core-SDO CSVs only "
+            "index January 2011, and each ARPIL split covers a different period, so "
+            "matching split names do NOT imply matching dates. Pass --pool-core-splits "
+            "(default) so every core split is searched, and pick a --mask-split whose "
+            "dates overlap January 2011 (validation covers 2011-01-15..2011-01-31)."
+        )
     return [{"timestamp": ts, "mask": mask_map[ts], "core": core_map[ts]} for ts in timestamps]
 
 
@@ -328,16 +671,12 @@ def read_core_stack(nc_path: Path, channels: list[str]) -> np.ndarray:
 
 
 def read_arpil_mask(h5_path: Path, key: str) -> np.ndarray:
-    with h5py.File(h5_path, "r") as handle:
-        if key in handle:
-            array = np.asarray(handle[key], dtype=np.float32)
-        else:
-            keys = list(handle.keys())
-            if not keys:
-                raise KeyError(f"No datasets found in {h5_path}")
-            array = np.asarray(handle[keys[0]], dtype=np.float32)
-    if array.ndim == 3:
-        array = array[0]
+    """Read a binary ARPIL mask, tolerating nested groups and extra axes.
+
+    Delegates dataset lookup to solar_ar.arrayio so the plugin and the training
+    dataset resolve HDF5 layouts identically.
+    """
+    array = load_array(h5_path, key=key, as_2d=True)
     return (array > 0).astype(np.float32)
 
 
@@ -531,9 +870,41 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
 
     logger.log(f"Downloading ARPIL split CSV: {args.mask_split}")
     mask_rows = read_csv_from_text(download_text(MASK_SPLIT_URLS[args.mask_split]))
-    logger.log(f"Downloading core-SDO index CSV: {args.mask_split}")
-    core_rows = read_csv_from_text(download_text(CORE_INDEX_URLS[args.mask_split]))
+
+    # The ARPIL and core-SDO repos use the same split NAMES for different date
+    # windows: every core-SDO CSV indexes January 2011 only, while ARPIL "train"
+    # skips January 2011 entirely (…2010-12-31, then 2011-02-15…). Pairing split
+    # to split therefore yields an empty intersection. The core splits are random
+    # shuffles of one month, so pooling them restores full coverage.
+    core_rows: list[dict[str, str]] = []
+    if getattr(args, "pool_core_splits", True):
+        seen_core: set[str] = set()
+        for split_name in sorted(CORE_INDEX_URLS):
+            logger.log(f"Downloading core-SDO index CSV: {split_name}")
+            try:
+                rows = read_csv_from_text(download_text(CORE_INDEX_URLS[split_name]))
+            except Exception as exc:  # a single missing split must not be fatal
+                logger.log(f"  core split {split_name} unavailable: {exc}")
+                continue
+            added = 0
+            for row in rows:
+                raw_path = row.get("path") or row.get("file_path") or ""
+                if not raw_path or raw_path in seen_core:
+                    continue
+                seen_core.add(raw_path)
+                core_rows.append(row)
+                added += 1
+            logger.debug(f"core_split={split_name} rows={len(rows)} new={added}")
+        logger.log(f"Pooled core-SDO index rows: {len(core_rows)}")
+    else:
+        logger.log(f"Downloading core-SDO index CSV: {args.mask_split}")
+        core_rows = read_csv_from_text(download_text(CORE_INDEX_URLS[args.mask_split]))
+
     aligned = align_arpil_and_core(mask_rows, core_rows)
+    logger.log(
+        f"Aligned {len(aligned)} frames "
+        f"({aligned[0]['timestamp']} .. {aligned[-1]['timestamp']})"
+    )
     if not aligned:
         raise RuntimeError("No aligned ARPIL/core-SDO timestamps were found.")
 
@@ -549,27 +920,45 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
             writer.writerow({"timestamp": item["timestamp"], "core_key": item["core"]["normalized_key"], "mask_path": item["mask"]["file_path"]})
 
     s3_client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+    mask_archive = MaskArchive(
+        download_cache / "data.tar.gz", mask_cache / "extracted", logger
+    )
     real_ids: list[str] = []
     provenance_rows: list[dict[str, str]] = []
     empty_counter = 0
+    frames_ok = 0
+    failed_frames: list[dict[str, str]] = []
 
     for frame_index, item in enumerate(selected, start=1):
         timestamp = item["timestamp"]
         core_key = item["core"]["normalized_key"]
         mask_rel = item["mask"]["file_path"]
         core_local = core_cache / core_key
-        mask_local = mask_cache / Path(mask_rel).name
         logger.log(f"[{frame_index}/{len(selected)}] fetching {timestamp}")
         logger.debug(f"core_s3_key={core_key} -> {core_local}")
-        logger.debug(f"mask_url={MASK_BASE_URL + mask_rel} -> {mask_local}")
-        download_core_s3(s3_client, core_key, core_local)
-        download_binary(MASK_BASE_URL + mask_rel, mask_local)
+        logger.debug(f"mask_member={mask_rel}")
+        # A single unreachable frame must not destroy an otherwise good run: at
+        # ~570 MB per frame a long download is very likely to hit at least one
+        # transient error. Record it, keep the real tiles already on disk, and
+        # let the synthetic backfill make up the shortfall.
+        try:
+            download_core_s3(s3_client, core_key, core_local)
+            mask_local = mask_archive.extract(mask_rel)
 
-        stack = read_core_stack(core_local, args.channels)
-        mask_full = read_arpil_mask(mask_local, args.mask_key)[None]
-        if stack.shape[1:] != mask_full.shape[1:]:
-            raise ValueError(f"Shape mismatch for {timestamp}: image={stack.shape[1:]} mask={mask_full.shape[1:]}")
+            stack = read_core_stack(core_local, args.channels)
+            mask_full = read_arpil_mask(mask_local, args.mask_key)[None]
+            if stack.shape[1:] != mask_full.shape[1:]:
+                raise ValueError(f"Shape mismatch for {timestamp}: image={stack.shape[1:]} mask={mask_full.shape[1:]}")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any frame-level failure is recoverable
+            reason = f"{type(exc).__name__}: {exc}"
+            failed_frames.append({"timestamp": timestamp, "core_key": core_key, "mask_path": mask_rel, "reason": reason})
+            logger.log(f"[{frame_index}/{len(selected)}] FRAME FAILED {timestamp} -> {reason}")
+            logger.log("  continuing; this frame's share will be covered by synthetic samples")
+            continue
 
+        frame_tiles = 0
         ys = iter_starts(mask_full.shape[1], args.tile_size, args.tile_stride)
         xs = iter_starts(mask_full.shape[2], args.tile_size, args.tile_stride)
         for y in ys:
@@ -599,6 +988,7 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
                     },
                 )
                 real_ids.append(sample_id)
+                frame_tiles += 1
                 logger.debug(f"keep_real_tile sample_id={sample_id} mask_fraction={fraction:.5f}")
                 provenance_rows.append(
                     {
@@ -612,6 +1002,34 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
                         "notes": f"mask_fraction={fraction:.5f}",
                     }
                 )
+        frames_ok += 1
+        logger.log(f"[{frame_index}/{len(selected)}] ok {timestamp} -> {frame_tiles} real tiles (running total {len(real_ids)})")
+
+    download_complete = not failed_frames
+    logger.log("--- Download summary ---")
+    logger.log(f"Frames requested : {len(selected)}")
+    logger.log(f"Frames downloaded: {frames_ok}")
+    logger.log(f"Frames failed    : {len(failed_frames)}")
+    logger.log(f"Download complete: {'yes' if download_complete else 'NO (incomplete)'}")
+    logger.log(f"Real tiles built : {len(real_ids)}")
+    if failed_frames:
+        with (metadata_dir / "failed_frames.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["timestamp", "core_key", "mask_path", "reason"])
+            writer.writeheader()
+            writer.writerows(failed_frames)
+        logger.log(f"Failed frames written to: {metadata_dir / 'failed_frames.csv'}")
+        for entry in failed_frames[:10]:
+            logger.log(f"  failed {entry['timestamp']}: {entry['reason']}")
+        if len(failed_frames) > 10:
+            logger.log(f"  ... and {len(failed_frames) - 10} more")
+
+    if not real_ids:
+        raise RuntimeError(
+            "No real tiles could be built - every frame download failed. "
+            "Synthetic samples are derived from real tiles, so training cannot start. "
+            f"See {metadata_dir / 'failed_frames.csv'} for the per-frame reasons, and check "
+            "network access to the S3 bucket and Hugging Face (see LIGHTNING_AI_TRAINING_GUIDE.md section 1b)."
+        )
 
     build_manifest_and_synthetic(
         dataset_dir=dataset_dir,
@@ -622,6 +1040,8 @@ def build_arpil_sdo_dataset(args: argparse.Namespace, dataset_dir: Path, logger:
         seed=args.seed,
         provenance_rows=provenance_rows,
         logger=logger,
+        frames_requested=len(selected),
+        frames_downloaded=frames_ok,
     )
 
     with (dataset_dir / "sources_used.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -647,6 +1067,8 @@ def build_manifest_and_synthetic(
     seed: int,
     provenance_rows: list[dict[str, str]],
     logger: Logger,
+    frames_requested: int = 0,
+    frames_downloaded: int = 0,
 ) -> None:
     rng = random.Random(seed)
     tiles_dir = dataset_dir / "tiles"
@@ -722,9 +1144,52 @@ def build_manifest_and_synthetic(
         writer.writerows(provenance_rows)
 
     unique_count = len({row["sample_id"] for row in provenance_rows})
-    logger.log(f"Real samples: {len(real_ids)}")
-    logger.log(f"Train real: {len(train_real_ids)} | Synthetic train: {len(synth_ids)} | Val real: {len(val_real_ids)}")
-    logger.log(f"Unique sample IDs: {unique_count}")
+    train_total = len(train_real_ids) + len(synth_ids)
+    real_pct = 100.0 * len(train_real_ids) / train_total if train_total else 0.0
+    synth_pct = 100.0 * len(synth_ids) / train_total if train_total else 0.0
+    target_real_pct = 100.0 * (1.0 - synthetic_ratio)
+    target_synth_pct = 100.0 * synthetic_ratio
+
+    composition = {
+        "frames_requested": frames_requested,
+        "frames_downloaded": frames_downloaded,
+        "download_complete": frames_requested == 0 or frames_downloaded >= frames_requested,
+        "train_real": len(train_real_ids),
+        "train_synthetic": len(synth_ids),
+        "train_total": train_total,
+        "val_real": len(val_real_ids),
+        "real_percent": round(real_pct, 2),
+        "synthetic_percent": round(synth_pct, 2),
+        "target_real_percent": round(target_real_pct, 2),
+        "target_synthetic_percent": round(target_synth_pct, 2),
+        "unique_sample_ids": unique_count,
+    }
+    composition_path = dataset_dir / "dataset_composition.json"
+    composition_path.write_text(json.dumps(composition, indent=2), encoding="utf-8")
+
+    logger.log("--- Dataset composition ---")
+    if frames_requested:
+        state = "COMPLETE" if composition["download_complete"] else "INCOMPLETE"
+        logger.log(f"Real-image download: {state} ({frames_downloaded}/{frames_requested} frames)")
+    logger.log(f"Real samples (all)  : {len(real_ids)}")
+    logger.log(f"Train REAL          : {len(train_real_ids)} ({real_pct:.1f}%, target {target_real_pct:.1f}%)")
+    logger.log(f"Train SYNTHETIC     : {len(synth_ids)} ({synth_pct:.1f}%, target {target_synth_pct:.1f}%)")
+    logger.log(f"Train total         : {train_total}")
+    logger.log(f"Val real            : {len(val_real_ids)}")
+    if train_total and abs(real_pct - target_real_pct) > 1.0:
+        logger.log(
+            f"NOTE: actual mix {real_pct:.1f}/{synth_pct:.1f} differs from the requested "
+            f"{target_real_pct:.0f}/{target_synth_pct:.0f} split "
+            "(too few real tiles to pair, or frames failed to download)."
+        )
+    if frames_requested and not composition["download_complete"]:
+        logger.log(
+            "NOTE: training is starting on a PARTIAL real set. Synthetic samples were "
+            "generated from the real tiles that did download. Re-run with --force-rebuild-dataset "
+            "once the network is healthy to pick up the missing frames."
+        )
+    logger.log(f"Unique sample IDs   : {unique_count}")
+    logger.log(f"Composition saved   : {composition_path}")
     logger.log(f"Manifest: {manifest_path}")
     logger.log(f"Saved provenance: {provenance_path}")
 
@@ -975,19 +1440,59 @@ def maybe_load_checkpoint(model, optimizer, scheduler, checkpoint_path: Path, me
     return start_epoch, best_metrics
 
 
-def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logger: Logger) -> None:
+def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logger: Logger, resource_plan=None) -> None:
     manifest_path = dataset_dir / "manifest.csv"
     train_dataset = H5TileDataset(manifest_path, split="train", augment=True, seed=args.seed)
     val_dataset = H5TileDataset(manifest_path, split="val", augment=False, seed=args.seed)
     with manifest_path.open("r", newline="", encoding="utf-8") as handle:
         val_rows = [row for row in csv.DictReader(handle) if row["split"] == "val"]
 
+    # Restate the mix from the manifest actually being trained on, so the number
+    # is visible even on a resumed run that skipped the dataset build.
+    train_real = sum(1 for row in train_dataset.rows if row.get("source_type") == "real")
+    train_synth = sum(1 for row in train_dataset.rows if row.get("source_type") == "synthetic")
+    train_total = train_real + train_synth
+    if train_total:
+        logger.log(
+            f"Training mix: {train_real} real ({100.0 * train_real / train_total:.1f}%) + "
+            f"{train_synth} synthetic ({100.0 * train_synth / train_total:.1f}%) = {train_total} samples"
+        )
+    composition_path = dataset_dir / "dataset_composition.json"
+    if composition_path.exists():
+        try:
+            saved = json.loads(composition_path.read_text(encoding="utf-8"))
+            if not saved.get("download_complete", True):
+                logger.log(
+                    f"WARNING: real-image download was INCOMPLETE "
+                    f"({saved.get('frames_downloaded')}/{saved.get('frames_requested')} frames). "
+                    "Training on the partial real set plus synthetic backfill."
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.log(f"Device: {device}")
-    logger.log(f"CPU threads: {args.cpu_threads}")
+    plan = resource_plan
+    if plan is not None:
+        logger.log(plan.describe())
+        # An explicit --num-workers wins; otherwise take the planned value.
+        workers = args.num_workers if args.num_workers > 0 else plan.dataloader_workers
+        pin_memory = plan.pin_memory
+    else:
+        logger.log(f"CPU threads: {args.cpu_threads}")
+        workers = args.num_workers
+        pin_memory = False
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, drop_last=False)
+    loader_kwargs = {
+        "num_workers": workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": workers > 0,
+    }
+    if workers > 0:
+        loader_kwargs["prefetch_factor"] = 4
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, **loader_kwargs)
 
     in_channels = 3
     model = AttentionUNet(in_channels=in_channels, out_channels=1, base_channels=args.base_channels, dropout=args.dropout).to(device)
@@ -1030,9 +1535,17 @@ def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logg
             for images, masks in val_loader:
                 images = images.to(device)
                 masks = masks.to(device)
-                with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
-                    logits = model(images)
+                if args.tta != "none":
+                    # Average over the D4 symmetries, then convert back to a
+                    # logit so the existing loss and metrics still apply.
+                    from solar_ar.tta import tta_predict
+
+                    logits = tta_predict(model, images, transforms=args.tta, return_logits=True)
                     loss = criterion(logits, masks)
+                else:
+                    with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
+                        logits = model(images)
+                        loss = criterion(logits, masks)
                 dice, iou = segmentation_metrics(logits, masks)
                 val_loss_total += float(loss.item())
                 val_dice_total += dice
@@ -1096,7 +1609,9 @@ def main() -> None:
     if args.no_auto_install_deps and any(importlib.util.find_spec(m) is None for m in REQUIRED_IMPORTS):
         raise RuntimeError("Required dependencies are missing and --no-auto-install-deps was requested.")
     seed_everything(args.seed)
-    set_cpu_runtime(args.cpu_threads)
+    # Kept out of `args` so that vars(args) stays JSON-serializable for
+    # run_config.json; passed explicitly to the training entry point instead.
+    resource_plan = set_cpu_runtime(args.cpu_threads, args.memory_budget_gb)
 
     work_dir = ensure_dir(Path(args.work_dir))
     dataset_dir = ensure_dir(work_dir / "dataset")
@@ -1120,7 +1635,7 @@ def main() -> None:
         logger.log(
             f"Dataset audit: total={audit['total']} train={audit['train']} val={audit['val']} synthetic_train={audit['synthetic_train']}"
         )
-        train_model(args, dataset_dir, run_dir, logger)
+        train_model(args, dataset_dir, run_dir, logger, resource_plan)
         logger.log("Training finished.")
     finally:
         logger.close()

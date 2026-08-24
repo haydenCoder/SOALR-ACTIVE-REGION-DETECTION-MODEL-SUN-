@@ -169,6 +169,64 @@ Training writes artifacts to the output directory, for example `runs/attention_u
 - `metrics.jsonl` — per-epoch logs
 - `train_config.json` — training arguments
 
+## Supported input file formats
+
+All loading goes through `src/solar_ar/arrayio.py`, so every script and the
+training pipeline read the same formats:
+
+| Extension | Reader | Typical source |
+| --- | --- | --- |
+| `.h5`, `.hdf5`, `.he5`, `.hdf` | h5py | ARPIL / SuryaBench masks, plugin tiles |
+| `.nc`, `.nc4`, `.netcdf`, `.cdf` | netCDF4 | core-SDO frames |
+| `.fits`, `.fit`, `.fts` | astropy | SHARP / SMARP / SunPy archives |
+| `.npy`, `.npz` | numpy | pre-processed patches |
+| `.png`, `.jpg`, `.jpeg`, `.bmp`, `.tif`, `.tiff` | Pillow | Zenodo UAD dataset |
+
+Compressed variants such as `frame.fits.gz` are detected automatically.
+
+### Choosing the dataset inside an HDF5/netCDF file
+
+These containers hold *named* datasets, so the loader needs to know which one to
+read. There are three ways to say so, in increasing priority:
+
+1. **Auto-detection** (default) — tries `union_with_intersect`, `mask`, `image`,
+   `data`, `segmentation`, then the first 2-D dataset in the file. Nested groups
+   are searched recursively.
+2. **A CLI flag** applied to the whole run:
+
+   ```bash
+   python train.py --manifest data/processed/arpil/manifest.csv \
+     --channels aia171 aia193 hmi_m \
+     --hdf5-image-key image \
+     --hdf5-mask-key union_with_intersect
+   ```
+
+3. **A per-file suffix in the manifest**, which overrides everything else:
+
+   ```csv
+   sample_id,split,image_aia171,mask
+   s0,train,frames/0.h5#image,masks/0.h5#masks/union_with_intersect
+   ```
+
+### Adding another format
+
+Add the extension to the right set in `src/solar_ar/arrayio.py`, write a
+`_load_<format>(path, key)` returning a 2-D `float32` array, and dispatch to it
+in `load_array`. Nothing else needs to change — the manifest builders and the
+training dataset both pick it up from `SUPPORTED_EXTENSIONS`.
+
+## Tests
+
+Run the suite with:
+
+```bash
+python -m pytest tests/ -q
+```
+
+Covers the multi-format loaders, download/retry logic, resource planning, TTA
+correctness (exact invertibility of every transform), the model's shapes and
+gradient flow, the LR schedule, EMA, and the RAM cache.
+
 ## Notes
 
 - The Docker image uses an official PyTorch CUDA runtime base image.
@@ -228,6 +286,95 @@ Notes:
 - The `solar_physics` normalization mode uses log compression for EUV and symmetric scaling for HMI polarity.
 - The dataset builder streams frame pairs and tiles them, so it is more disk-friendly than downloading a huge archive first.
 
+
+## Hardware utilisation (up to 15 GB RAM / 4 CPUs)
+
+Training claims as much of the machine as the budget allows, and **clamps to
+what the machine actually has** — the same command works on a 2-core laptop and
+on a 4-core/15 GB box.
+
+```bash
+python train.py --manifest data/processed/uad/manifest.csv \
+  --cpu-budget 4 --memory-budget-gb 15 --auto-batch-size
+```
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--cpu-budget` | `4` | Target cores. Sets torch intra-/inter-op threads, BLAS thread env vars and DataLoader workers. |
+| `--memory-budget-gb` | `15` | Target RAM. Sizes the in-RAM sample cache and `--auto-batch-size`. |
+| `--cache-fraction` | `0.45` | Share of the budget spent caching decoded samples. |
+| `--auto-batch-size` | off | Picks the largest batch size that fits the memory budget. |
+| `--no-channels-last` | on | Disables the channels-last memory format. |
+
+How the budget is spent:
+
+- **CPU** — thread counts are set *before* numpy/torch import (BLAS pools are
+  sized at import time), plus `OMP_WAIT_POLICY=ACTIVE` to keep worker threads
+  spinning instead of sleeping between the many small ops a U-Net issues.
+- **RAM** — decoded, normalized, resized samples are cached in memory. Decoding
+  FITS/HDF5 and percentile-normalizing costs more than the CPU forward pass, so
+  from the second epoch on the run becomes compute-bound. The cache budget is
+  divided by the worker count, since each worker process holds its own copy.
+- Both are detected **cgroup-aware**, so a container limit is respected rather
+  than the host's core count.
+
+Each epoch logs `samples/s`, resident memory and the cache hit rate; the
+resolved plan is written to `runtime.json` in the run directory.
+
+## Test-time augmentation (TTA)
+
+Active regions have no canonical orientation, so predictions are averaged over
+the symmetries of the square (the D4 group). Every transform is exactly
+invertible, so no interpolation blur is introduced, and probabilities — not
+logits — are averaged so a single confident view cannot dominate.
+
+```bash
+python train.py --manifest ... --tta d4     # 8 views, best accuracy
+python train.py --manifest ... --tta flips  # 4 views, half the cost
+```
+
+`--tta` applies to validation, so the reported Dice reflects the inference path
+you would actually deploy. For full-disk frames larger than the training tile,
+`solar_ar.tta.sliding_window_predict` tiles the image and blends overlaps with a
+cosine window to avoid visible seams.
+
+## Better Attention U-Net training
+
+Architecture (`src/solar_ar/models/attention_unet.py`):
+
+| Flag | Effect |
+| --- | --- |
+| `--model-depth` | Encoder/decoder levels (default 4). |
+| `--deep-supervision` | Auxiliary losses on intermediate decoder stages, upsampled to full resolution. Pushes gradient into deep layers early. |
+| `--norm-groups N` | GroupNorm instead of BatchNorm — **recommended for batch sizes below 8**, where batch statistics are too noisy. |
+| `--no-residual` / `--no-se` | Disable residual connections / squeeze-excitation channel attention (both on by default). |
+
+Optimisation:
+
+| Flag | Effect |
+| --- | --- |
+| `--ema-decay 0.999` | Exponential moving average of weights; validation and early stopping use the EMA weights, and they are saved as `ema_state_dict`. |
+| `--grad-clip` | Max gradient norm, default `1.0` (correctly unscaled first under AMP). |
+| `--warmup-epochs` | Linear LR warmup before cosine decay, stepped per optimizer step. Prevents the early all-background collapse AdamW can cause on a fresh U-Net. |
+| `--loss combo` | Blends BCE-Dice with Focal-Tversky, penalising false negatives on small regions. |
+
+Training augmentation now includes photometric jitter (gain/bias, gamma, noise)
+alongside the D4 geometric transforms, modelling instrument-response drift so
+the network keys on morphology rather than absolute brightness.
+
+### Measured effect
+
+On a synthetic 24-sample benchmark, best val Dice, mean of 3 seeds:
+
+| Configuration | 8 epochs | 40 epochs |
+| --- | --- | --- |
+| Baseline (plain U-Net) | **0.858** | 0.916 |
+| Residual + SE + deep supervision + combo + EMA | 0.593 | 0.987 |
+| ...plus D4 TTA | 0.450 | **0.991** |
+
+The ordering **reverses** with training length: regularisation (EMA, warmup,
+deep supervision, GroupNorm) trades early-epoch speed for final quality. Judge
+these options on a converged run — on a short one they will look worse.
 
 ## Single-file plugin
 

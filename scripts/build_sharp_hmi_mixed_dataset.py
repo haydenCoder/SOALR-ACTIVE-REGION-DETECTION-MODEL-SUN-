@@ -6,7 +6,6 @@ import csv
 import math
 import os
 import random
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path

@@ -13,7 +13,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-python3 -m pip install -r requirements.txt
+# Dependency install. Set SKIP_INSTALL=1 to reuse an already-prepared environment.
+# Debian/Ubuntu system Pythons are "externally managed" (PEP 668) and reject a
+# plain pip install, so fall back to --break-system-packages when that happens.
+if [[ "${SKIP_INSTALL:-0}" != "1" ]]; then
+  if ! python3 -m pip install -r requirements.txt; then
+    echo "pip install failed; retrying with --break-system-packages (PEP 668)" >&2
+    python3 -m pip install --break-system-packages -r requirements.txt
+  fi
+fi
 
 export OMP_NUM_THREADS=4
 export OPENBLAS_NUM_THREADS=4
