@@ -108,6 +108,8 @@ class Trainer:
         seed: int,
         loss_name: str,
         grad_accumulation_steps: int,
+        hdf5_image_key: str | None = None,
+        hdf5_mask_key: str | None = None,
     ) -> None:
         seed_everything(seed)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -131,6 +133,8 @@ class Trainer:
             normalize_mode=normalize_mode,
             augment=True,
             seed=seed,
+            hdf5_image_key=hdf5_image_key,
+            hdf5_mask_key=hdf5_mask_key,
         )
         val_dataset = SolarActiveRegionDataset(
             manifest_path=manifest_path,
@@ -140,6 +144,8 @@ class Trainer:
             normalize_mode=normalize_mode,
             augment=False,
             seed=seed,
+            hdf5_image_key=hdf5_image_key,
+            hdf5_mask_key=hdf5_mask_key,
         )
 
         self.train_loader = DataLoader(

@@ -7,7 +7,6 @@ import os
 import random
 import tempfile
 from pathlib import Path
-from typing import Iterable
 
 import boto3
 import h5py

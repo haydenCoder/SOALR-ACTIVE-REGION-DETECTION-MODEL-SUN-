@@ -6,9 +6,14 @@ import csv
 import os
 import random
 import re
+import sys
 from pathlib import Path
 
-SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".npy", ".npz", ".fits", ".fit", ".fts"}
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+# Single source of truth, shared with the training dataset loader, so adding a
+# format in solar_ar/arrayio.py automatically makes it discoverable here.
+from solar_ar.arrayio import SUPPORTED_EXTENSIONS, file_extension  # noqa: E402
 DEFAULT_CHANNEL_SPECS = ["171=training_images_171", "195=training_images_195", "284=training_images_284", "304=training_images_304"]
 
 
@@ -37,7 +42,7 @@ def normalize_key(path: Path) -> str:
 
 
 def index_files(root: Path) -> dict[str, Path]:
-    files = [path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS]
+    files = [path for path in root.rglob("*") if path.is_file() and file_extension(path) in SUPPORTED_EXTENSIONS]
     mapping: dict[str, Path] = {}
     for path in files:
         key = normalize_key(path)

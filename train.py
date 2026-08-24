@@ -46,6 +46,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Number of optimizer accumulation steps. Useful for low-RAM training.",
     )
+    parser.add_argument(
+        "--hdf5-image-key",
+        default=None,
+        help=(
+            "Dataset/variable name to read from HDF5, netCDF or npz image files "
+            "(e.g. 'image'). A 'path#key' suffix in the manifest overrides this."
+        ),
+    )
+    parser.add_argument(
+        "--hdf5-mask-key",
+        default=None,
+        help="Dataset/variable name for mask files (e.g. 'union_with_intersect' for ARPIL masks).",
+    )
     parser.add_argument("--torch-num-threads", type=int, default=0, help="Set PyTorch intra-op CPU threads (0 = keep default)")
     parser.add_argument(
         "--torch-num-interop-threads",
@@ -87,6 +100,8 @@ def main() -> None:
         seed=args.seed,
         loss_name=args.loss,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        hdf5_image_key=args.hdf5_image_key,
+        hdf5_mask_key=args.hdf5_mask_key,
     )
     trainer.fit()
 

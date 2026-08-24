@@ -19,3 +19,8 @@ logs/
 data/raw/
 data/processed/
 !data/.gitkeep
+
+# Test / tooling caches
+.pytest_cache/
+__pycache__/
+*.py[cod]

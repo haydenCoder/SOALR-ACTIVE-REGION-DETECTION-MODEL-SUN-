@@ -27,13 +27,21 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from time import perf_counter
+
+# Share the array/HDF5 readers with the training package so both understand the
+# same file layouts and dataset-key conventions. The actual import happens in
+# load_runtime_modules(), after dependencies are guaranteed to be installed --
+# solar_ar.arrayio imports numpy at module scope.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 # CPU-oriented defaults. Users can still override via env or CLI.
 os.environ.setdefault("OMP_NUM_THREADS", "4")
@@ -95,6 +103,7 @@ DataLoader = None
 Dataset = None
 Image = None
 ImageOps = None
+load_array = None
 
 
 @dataclass
@@ -133,26 +142,98 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def _pip_install(arguments: list[str]) -> subprocess.CompletedProcess:
+    """Run pip, retrying with --break-system-packages on PEP 668 environments.
+
+    Debian/Ubuntu mark their system Python "externally managed", so a plain
+    ``pip install`` aborts with error: externally-managed-environment. Retrying
+    with the escape hatch keeps the plugin usable on those images without
+    forcing the caller to build a virtualenv first.
+    """
+    command = [sys.executable, "-m", "pip", "install", *arguments]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result
+
+    output = f"{result.stdout}\n{result.stderr}"
+    if "externally-managed-environment" in output or "externally managed" in output:
+        print("Externally managed environment detected; retrying with --break-system-packages", flush=True)
+        result = subprocess.run([*command, "--break-system-packages"], capture_output=True, text=True)
+        if result.returncode == 0:
+            return result
+        output = f"{result.stdout}\n{result.stderr}"
+
+    raise RuntimeError(
+        "Dependency installation failed.\n"
+        f"  command: {' '.join(command)}\n"
+        f"  exit code: {result.returncode}\n"
+        f"{output.strip()[-1500:]}\n\n"
+        "Install the requirements manually, then re-run with SOLAR_PLUGIN_NO_AUTO_INSTALL=1:\n"
+        f"  {sys.executable} -m pip install -r requirements.txt"
+    )
+
+
+def missing_dependencies() -> list[str]:
+    """Return the pip package names whose import modules are not importable."""
+    return sorted(
+        {pkg for module, pkg in REQUIRED_IMPORTS.items() if importlib.util.find_spec(module) is None}
+    )
+
+
 def bootstrap_dependencies(requirements_path: Path, auto_install: bool = True) -> None:
-    missing = [pkg for module, pkg in REQUIRED_IMPORTS.items() if importlib.util.find_spec(module) is None]
+    missing = missing_dependencies()
     if not missing:
         return
+
     if not auto_install:
-        raise RuntimeError(f"Missing Python packages: {missing}. Install requirements first.")
+        raise RuntimeError(
+            f"Missing Python packages: {missing}\n"
+            "Auto-install is disabled (SOLAR_PLUGIN_NO_AUTO_INSTALL=1). Install them with:\n"
+            f"  {sys.executable} -m pip install -r requirements.txt"
+        )
 
     print(f"Missing packages detected: {missing}", flush=True)
     if requirements_path.exists():
         print(f"Installing dependencies from {requirements_path} ...", flush=True)
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(requirements_path)], check=True)
+        _pip_install(["-r", str(requirements_path)])
     else:
         print("requirements.txt not found, installing fallback package list...", flush=True)
-        subprocess.run([sys.executable, "-m", "pip", "install", *sorted(set(missing))], check=True)
+        _pip_install(missing)
 
     importlib.invalidate_caches()
 
+    still_missing = missing_dependencies()
+    if still_missing:
+        raise RuntimeError(
+            f"These packages are still unimportable after installation: {still_missing}. "
+            "The install may have targeted a different interpreter than "
+            f"{sys.executable}."
+        )
+
 
 def load_runtime_modules() -> None:
-    global boto3, h5py, np, requests, torch, F, fits, UNSIGNED, Config, NetCDFDataset, nn, DataLoader, Dataset, Image, ImageOps
+    """Import every third-party module into this module's globals.
+
+    Everything below is imported lazily because the plugin may need to install
+    its own dependencies first. If an import fails we raise immediately with the
+    package name, otherwise the globals stay ``None`` and the failure surfaces
+    much later as a confusing ``NameError: name 'np' is not defined``.
+    """
+    try:
+        _import_runtime_modules()
+    except ImportError as exc:
+        module_name = getattr(exc, "name", None) or "a required module"
+        package = REQUIRED_IMPORTS.get(module_name, module_name)
+        raise RuntimeError(
+            f"Failed to import {module_name!r}, which is required to run this plugin.\n"
+            f"Install it with: {sys.executable} -m pip install {package}\n"
+            f"Or install everything with: {sys.executable} -m pip install -r requirements.txt\n"
+            f"Original error: {exc}"
+        ) from exc
+
+
+def _import_runtime_modules() -> None:
+    global boto3, h5py, np, requests, torch, F, fits, UNSIGNED, Config, NetCDFDataset, nn, DataLoader, Dataset, Image, ImageOps, load_array
     import boto3 as _boto3
     import h5py as _h5py
     import numpy as _np
@@ -182,6 +263,10 @@ def load_runtime_modules() -> None:
     Dataset = _Dataset
     Image = _Image
     ImageOps = _ImageOps
+
+    from solar_ar.arrayio import load_array as _load_array
+
+    load_array = _load_array
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -231,22 +316,95 @@ def set_cpu_runtime(cpu_threads: int) -> None:
     torch.set_num_interop_threads(1)
 
 
+#: Marker that starts every Git LFS pointer file. Hugging Face's ``raw/`` endpoint
+#: serves these instead of the real content for LFS-tracked files, which would
+#: otherwise be parsed as a one-row CSV of garbage.
+_LFS_POINTER_PREFIX = "version https://git-lfs.github.com/spec/v1"
+
+
+def _request_with_retries(
+    url: str,
+    *,
+    timeout: int,
+    stream: bool = False,
+    attempts: int = 4,
+):
+    """GET ``url``, retrying transient failures with exponential backoff.
+
+    Large public datasets routinely return 429/5xx or drop the connection
+    mid-transfer; without retries a multi-hour build dies on one blip.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, timeout=timeout, stream=stream)
+            if response.status_code in {429, 500, 502, 503, 504}:
+                raise RuntimeError(f"HTTP {response.status_code} from {url}")
+            response.raise_for_status()
+            return response
+        except Exception as exc:  # noqa: BLE001 - retry on any transport failure
+            last_error = exc
+            if attempt == attempts:
+                break
+            delay = min(2 ** attempt, 30)
+            print(f"  request failed ({exc}); retry {attempt}/{attempts - 1} in {delay}s", flush=True)
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"Failed to download {url} after {attempts} attempts. Last error: {last_error}\n"
+        "If this host is unreachable from your network, pre-download the data and use "
+        "--source-mode sharp_sample or the offline scripts in scripts/."
+    ) from last_error
+
+
 def download_text(url: str, timeout: int = 300) -> str:
-    response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.text
+    response = _request_with_retries(url, timeout=timeout)
+    text = response.text
+
+    if text.lstrip().startswith(_LFS_POINTER_PREFIX):
+        # Retry through the resolve/ endpoint, which streams real content.
+        resolved = url.replace("/raw/", "/resolve/")
+        if resolved != url:
+            print(f"  {url} returned a Git LFS pointer; retrying via {resolved}", flush=True)
+            text = _request_with_retries(resolved, timeout=timeout).text
+        if text.lstrip().startswith(_LFS_POINTER_PREFIX):
+            raise RuntimeError(
+                f"{url} returned a Git LFS pointer rather than file content. "
+                "Use the '/resolve/main/' URL form for LFS-tracked files."
+            )
+    return text
 
 
 def download_binary(url: str, destination: Path, timeout: int = 600) -> None:
-    if destination.exists():
+    """Stream ``url`` to ``destination``, atomically and idempotently.
+
+    Downloads land in a ``.part`` file that is renamed only on success, so an
+    interrupted run cannot leave a truncated file that later looks complete.
+    """
+    if destination.exists() and destination.stat().st_size > 0:
         return
     ensure_dir(destination.parent)
-    with requests.get(url, stream=True, timeout=timeout) as response:
-        response.raise_for_status()
-        with destination.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    handle.write(chunk)
+    temp_path = destination.with_name(destination.name + ".part")
+
+    try:
+        with _request_with_retries(url, timeout=timeout, stream=True) as response:
+            with temp_path.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+
+        if temp_path.stat().st_size == 0:
+            raise RuntimeError(f"Downloaded an empty file from {url}")
+
+        with temp_path.open("rb") as handle:
+            if handle.read(len(_LFS_POINTER_PREFIX)).decode("utf-8", "ignore") == _LFS_POINTER_PREFIX:
+                raise RuntimeError(
+                    f"{url} returned a Git LFS pointer rather than file content. "
+                    "Use the '/resolve/main/' URL form for LFS-tracked files."
+                )
+        temp_path.replace(destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def normalize_core_key(path_value: str) -> str:
@@ -261,27 +419,81 @@ def normalize_core_key(path_value: str) -> str:
 
 
 def read_csv_from_text(text: str) -> list[dict[str, str]]:
-    return list(csv.DictReader(text.splitlines()))
+    rows = list(csv.DictReader(text.splitlines()))
+    if not rows:
+        raise RuntimeError(
+            "Index CSV parsed to zero rows. The download may have returned an error page "
+            "or a Git LFS pointer instead of the real file."
+        )
+    return rows
+
+
+#: Cell values that mean "this frame is not available".
+_ABSENT_VALUES = {"", "0", "0.0", "false", "no", "nan", "none"}
+
+
+def is_present(row: dict[str, str]) -> bool:
+    """Return True unless the row explicitly marks the frame as absent.
+
+    Older index CSVs have no ``present`` column at all. Defaulting a missing
+    column to "absent" silently discarded every row and surfaced as a confusing
+    "no aligned timestamps" error, so an absent column now means "keep".
+    """
+    if "present" not in row:
+        return True
+    value = row.get("present")
+    if value is None:
+        return True
+    return str(value).strip().lower() not in _ABSENT_VALUES
+
+
+def timestamp_key(path_value: str) -> str:
+    """Extract the ``YYYYMMDD_HHMM`` stamp that links a mask to its core frame.
+
+    Falls back to the bare filename stem when no stamp is present so unusual
+    naming still matches instead of silently dropping the pair.
+    """
+    stem = Path(str(path_value)).name
+    for suffix in (".h5", ".hdf5", ".nc", ".nc4", ".npz", ".npy"):
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    match = re.search(r"(\d{8}[_T]?\d{4,6})", stem)
+    if match:
+        return match.group(1).replace("T", "_")
+    return stem
 
 
 def align_arpil_and_core(mask_rows: list[dict[str, str]], core_rows: list[dict[str, str]]) -> list[dict[str, str]]:
     mask_map: dict[str, dict[str, str]] = {}
     for row in mask_rows:
-        if row.get("present", "0") in {"0", "0.0", "", None}:
+        if not is_present(row):
             continue
-        mask_path = row.get("file_path", "")
+        mask_path = row.get("file_path") or row.get("path") or ""
         if not mask_path:
             continue
-        mask_map[Path(mask_path).stem] = row
+        mask_map[timestamp_key(mask_path)] = row
 
     core_map: dict[str, dict[str, str]] = {}
     for row in core_rows:
-        if row.get("present", "1") in {"0", "0.0", "", None}:
+        if not is_present(row):
             continue
-        key = normalize_core_key(row["path"])
-        core_map[Path(key).stem] = {**row, "normalized_key": key}
+        raw_path = row.get("path") or row.get("file_path") or ""
+        if not raw_path:
+            continue
+        key = normalize_core_key(raw_path)
+        core_map[timestamp_key(key)] = {**row, "normalized_key": key}
 
     timestamps = sorted(set(mask_map) & set(core_map))
+    if not timestamps:
+        raise RuntimeError(
+            "No timestamps are common to the ARPIL mask index and the core-SDO index.\n"
+            f"  mask rows usable: {len(mask_map)} (of {len(mask_rows)})\n"
+            f"  core rows usable: {len(core_map)} (of {len(core_rows)})\n"
+            f"  example mask keys: {sorted(mask_map)[:3]}\n"
+            f"  example core keys: {sorted(core_map)[:3]}\n"
+            "The index CSV layout may have changed upstream."
+        )
     return [{"timestamp": ts, "mask": mask_map[ts], "core": core_map[ts]} for ts in timestamps]
 
 
@@ -328,16 +540,12 @@ def read_core_stack(nc_path: Path, channels: list[str]) -> np.ndarray:
 
 
 def read_arpil_mask(h5_path: Path, key: str) -> np.ndarray:
-    with h5py.File(h5_path, "r") as handle:
-        if key in handle:
-            array = np.asarray(handle[key], dtype=np.float32)
-        else:
-            keys = list(handle.keys())
-            if not keys:
-                raise KeyError(f"No datasets found in {h5_path}")
-            array = np.asarray(handle[keys[0]], dtype=np.float32)
-    if array.ndim == 3:
-        array = array[0]
+    """Read a binary ARPIL mask, tolerating nested groups and extra axes.
+
+    Delegates dataset lookup to solar_ar.arrayio so the plugin and the training
+    dataset resolve HDF5 layouts identically.
+    """
+    array = load_array(h5_path, key=key, as_2d=True)
     return (array > 0).astype(np.float32)
 
 

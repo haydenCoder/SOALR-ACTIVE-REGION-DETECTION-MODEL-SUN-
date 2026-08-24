@@ -8,15 +8,12 @@ from typing import Sequence
 
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
 
-SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".npy", ".npz", ".fits", ".fit", ".fts"}
+from solar_ar.arrayio import SUPPORTED_EXTENSIONS, load_array
 
-try:
-    from astropy.io import fits  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    fits = None
+# Re-exported for callers that historically imported it from this module.
+__all__ = ["SampleRecord", "SolarActiveRegionDataset", "SUPPORTED_EXTENSIONS"]
 
 
 @dataclass
@@ -38,6 +35,8 @@ class SolarActiveRegionDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         normalize_mode: str = "percentile",
         augment: bool = False,
         seed: int = 42,
+        hdf5_image_key: str | None = None,
+        hdf5_mask_key: str | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.channels = list(channels)
@@ -47,34 +46,71 @@ class SolarActiveRegionDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         self.normalize_mode = normalize_mode
         self.augment = augment
         self.random = random.Random(seed)
+        # Dataset/variable names used for container formats (HDF5, netCDF, npz).
+        # A ``path#key`` suffix in the manifest overrides these per file.
+        self.hdf5_image_key = hdf5_image_key
+        self.hdf5_mask_key = hdf5_mask_key
         self.records = self._load_records()
 
         if not self.records:
             raise ValueError(f"No samples found for split='{split}' in {self.manifest_path}.")
 
+    def _resolve(self, base_dir: Path, value: str) -> Path:
+        """Resolve a manifest cell to a path, keeping any ``#dataset`` suffix.
+
+        Relative paths are interpreted against the manifest's own directory so
+        a dataset folder stays portable; absolute paths are left untouched.
+        """
+        value = (value or "").strip()
+        if not value:
+            raise ValueError(f"Empty path cell in manifest {self.manifest_path}")
+        file_part, separator, key_part = value.partition("#")
+        path = Path(file_part)
+        if not path.is_absolute():
+            path = base_dir / path
+        return Path(f"{path}{separator}{key_part}") if separator else path
+
     def _load_records(self) -> list[SampleRecord]:
+        if not self.manifest_path.exists():
+            raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
+
         base_dir = self.manifest_path.parent
         records: list[SampleRecord] = []
-        with self.manifest_path.open("r", newline="") as handle:
+        seen_splits: set[str] = set()
+
+        with self.manifest_path.open("r", newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
             expected_columns = {"sample_id", "split", "mask", *(f"image_{channel}" for channel in self.channels)}
-            missing = expected_columns.difference(reader.fieldnames or [])
+            missing = expected_columns.difference(fieldnames)
             if missing:
-                raise ValueError(f"Manifest {self.manifest_path} is missing columns: {sorted(missing)}")
+                raise ValueError(
+                    f"Manifest {self.manifest_path} is missing columns: {sorted(missing)}. "
+                    f"Found columns: {fieldnames}. "
+                    f"Check that --channels matches the image_* columns in the manifest."
+                )
 
             for row in reader:
-                if row["split"].lower() != self.split.lower():
+                row_split = (row.get("split") or "").strip()
+                seen_splits.add(row_split)
+                if row_split.lower() != self.split.lower():
                     continue
-                image_paths = [base_dir / row[f"image_{channel}"] for channel in self.channels]
-                mask_path = base_dir / row["mask"]
                 records.append(
                     SampleRecord(
                         sample_id=row["sample_id"],
-                        split=row["split"],
-                        image_paths=image_paths,
-                        mask_path=mask_path,
+                        split=row_split,
+                        image_paths=[
+                            self._resolve(base_dir, row[f"image_{channel}"]) for channel in self.channels
+                        ],
+                        mask_path=self._resolve(base_dir, row["mask"]),
                     )
                 )
+
+        if not records and seen_splits:
+            raise ValueError(
+                f"No rows with split='{self.split}' in {self.manifest_path}. "
+                f"Splits present in the manifest: {sorted(seen_splits)}."
+            )
         return records
 
     def __len__(self) -> int:
@@ -82,9 +118,9 @@ class SolarActiveRegionDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         record = self.records[index]
-        channels = [self._load_image(path) for path in record.image_paths]
+        channels = [self._load_image(path, self.hdf5_image_key) for path in record.image_paths]
         image = np.stack(channels, axis=0).astype(np.float32)
-        mask = self._load_image(record.mask_path).astype(np.float32)
+        mask = self._load_image(record.mask_path, self.hdf5_mask_key).astype(np.float32)
 
         image = self._normalize(image)
         mask = (mask > self.mask_threshold).astype(np.float32)[None, ...]
@@ -169,34 +205,11 @@ class SolarActiveRegionDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return image.contiguous(), mask.contiguous()
 
     @staticmethod
-    def _load_image(path: Path) -> np.ndarray:
-        if not path.exists():
-            raise FileNotFoundError(f"Expected file does not exist: {path}")
+    def _load_image(path: Path, key: str | None = None) -> np.ndarray:
+        """Load one 2-D plane from any supported container.
 
-        suffix = path.suffix.lower()
-        if suffix not in SUPPORTED_EXTENSIONS:
-            raise ValueError(f"Unsupported file extension: {path}")
-
-        if suffix == ".npy":
-            array = np.load(path)
-        elif suffix == ".npz":
-            archive = np.load(path)
-            if len(archive.files) != 1:
-                raise ValueError(f"Expected a single-array npz file, got keys={archive.files} for {path}")
-            array = archive[archive.files[0]]
-        elif suffix in {".fits", ".fit", ".fts"}:
-            if fits is None:
-                raise ImportError(
-                    "FITS input requires astropy. Install dependencies from requirements.txt or use Docker."
-                )
-            array = fits.getdata(path)
-        else:
-            with Image.open(path) as image:
-                array = np.asarray(image.convert("F"), dtype=np.float32)
-
-        array = np.asarray(array, dtype=np.float32)
-        if array.ndim == 3:
-            array = array[..., 0]
-        if array.ndim != 2:
-            raise ValueError(f"Expected a 2D image for {path}, got shape={array.shape}")
-        return array
+        Delegates to :func:`solar_ar.arrayio.load_array`, which handles HDF5,
+        netCDF, FITS, npy/npz and ordinary images, and resolves ``path#dataset``
+        specs for the formats that hold named datasets.
+        """
+        return load_array(path, key=key, as_2d=True)

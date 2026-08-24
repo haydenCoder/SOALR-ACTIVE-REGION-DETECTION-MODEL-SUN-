@@ -169,6 +169,58 @@ Training writes artifacts to the output directory, for example `runs/attention_u
 - `metrics.jsonl` — per-epoch logs
 - `train_config.json` — training arguments
 
+## Supported input file formats
+
+All loading goes through `src/solar_ar/arrayio.py`, so every script and the
+training pipeline read the same formats:
+
+| Extension | Reader | Typical source |
+| --- | --- | --- |
+| `.h5`, `.hdf5`, `.he5`, `.hdf` | h5py | ARPIL / SuryaBench masks, plugin tiles |
+| `.nc`, `.nc4`, `.netcdf`, `.cdf` | netCDF4 | core-SDO frames |
+| `.fits`, `.fit`, `.fts` | astropy | SHARP / SMARP / SunPy archives |
+| `.npy`, `.npz` | numpy | pre-processed patches |
+| `.png`, `.jpg`, `.jpeg`, `.bmp`, `.tif`, `.tiff` | Pillow | Zenodo UAD dataset |
+
+Compressed variants such as `frame.fits.gz` are detected automatically.
+
+### Choosing the dataset inside an HDF5/netCDF file
+
+These containers hold *named* datasets, so the loader needs to know which one to
+read. There are three ways to say so, in increasing priority:
+
+1. **Auto-detection** (default) — tries `union_with_intersect`, `mask`, `image`,
+   `data`, `segmentation`, then the first 2-D dataset in the file. Nested groups
+   are searched recursively.
+2. **A CLI flag** applied to the whole run:
+
+   ```bash
+   python train.py --manifest data/processed/arpil/manifest.csv \
+     --channels aia171 aia193 hmi_m \
+     --hdf5-image-key image \
+     --hdf5-mask-key union_with_intersect
+   ```
+
+3. **A per-file suffix in the manifest**, which overrides everything else:
+
+   ```csv
+   sample_id,split,image_aia171,mask
+   s0,train,frames/0.h5#image,masks/0.h5#masks/union_with_intersect
+   ```
+
+### Adding another format
+
+Add the extension to the right set in `src/solar_ar/arrayio.py`, write a
+`_load_<format>(path, key)` returning a 2-D `float32` array, and dispatch to it
+in `load_array`. Nothing else needs to change — the manifest builders and the
+training dataset both pick it up from `SUPPORTED_EXTENSIONS`.
+
+## Tests
+
+```bash
+python -m pytest tests/ -q
+```
+
 ## Notes
 
 - The Docker image uses an official PyTorch CUDA runtime base image.
