@@ -28,6 +28,36 @@ git fetch origin arena/01a03190-soalr-active-region-detection
 git checkout arena/01a03190-soalr-active-region-detection
 ```
 
+### Already have an older copy in the Studio?
+
+If the Studio already contains a checkout from before the mask fix, **replace it
+before running** — the old `solar_arpil_plugin.py` builds per-frame mask URLs
+that 404, so it will fail on every ARPIL frame. Refresh in place:
+
+```bash
+cd SOALR-ACTIVE-REGION-DETECTION-MODEL-SUN-
+git fetch origin arena/01a03190-soalr-active-region-detection
+git checkout arena/01a03190-soalr-active-region-detection
+git reset --hard origin/arena/01a03190-soalr-active-region-detection
+```
+
+`reset --hard` discards local edits to tracked files. If you changed anything you
+want to keep, `git stash` first. Untracked files — including `plugin_runs/` and
+any downloaded data — are left alone, so checkpoints and caches survive.
+
+If the old copy was downloaded as a zip rather than cloned, it has no git
+history to update; delete the directory and clone fresh instead:
+
+```bash
+rm -rf SOALR-ACTIVE-REGION-DETECTION-MODEL-SUN-
+```
+
+Then confirm the fix is actually present in the working copy:
+
+```bash
+grep -c MASK_ARCHIVE_URL solar_arpil_plugin.py    # must print 2, not 0
+```
+
 Verify you are on the right commit and that the code is healthy before training:
 
 ```bash
