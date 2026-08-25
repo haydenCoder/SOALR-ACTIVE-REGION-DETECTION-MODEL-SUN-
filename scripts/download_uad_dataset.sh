@@ -12,10 +12,8 @@ NODE_TOOLS_DIR="${TOOLS_DIR}/npm-7zip"
 SEVEN_Z_BIN="${NODE_TOOLS_DIR}/node_modules/7zip-bin-full/linux/x64/7zz"
 
 ensure_7zz() {
-  if command -v 7z >/dev/null 2>&1; then
-    echo "7z"
-    return
-  fi
+  # Ubuntu's p7zip-full is version 16.02 in Colab and cannot read this
+  # dataset's RAR compression method. Prefer a current official 7-Zip binary.
   if command -v 7zz >/dev/null 2>&1; then
     echo "7zz"
     return
@@ -24,22 +22,22 @@ ensure_7zz() {
     echo "${SEVEN_Z_BIN}"
     return
   fi
-  if ! command -v npm >/dev/null 2>&1; then
-    echo "7-Zip is required. In Colab run: !apt-get update && apt-get install -y p7zip-full" >&2
-    exit 1
+  if command -v npm >/dev/null 2>&1; then
+    mkdir -p "${NODE_TOOLS_DIR}"
+    echo "Installing current standalone 7-Zip binary..." >&2
+    (
+      cd "${NODE_TOOLS_DIR}"
+      if [[ ! -f package.json ]]; then
+        npm init -y >/dev/null 2>&1
+      fi
+      npm install 7zip-bin-full --no-save >/dev/null
+    )
+    chmod +x "${SEVEN_Z_BIN}"
+    echo "${SEVEN_Z_BIN}"
+    return
   fi
-
-  mkdir -p "${NODE_TOOLS_DIR}"
-  echo "Installing standalone 7-Zip binary via npm..." >&2
-  (
-    cd "${NODE_TOOLS_DIR}"
-    if [[ ! -f package.json ]]; then
-      npm init -y >/dev/null 2>&1
-    fi
-    npm install 7zip-bin-full --no-save >/dev/null
-  )
-  chmod +x "${SEVEN_Z_BIN}"
-  echo "${SEVEN_Z_BIN}"
+  echo "A current 7-Zip '7zz' binary is required; npm was not found to install it." >&2
+  exit 1
 }
 
 extract_archive() {
