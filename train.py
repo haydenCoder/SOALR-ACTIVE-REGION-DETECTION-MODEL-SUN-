@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--amp", action="store_true", default=True, help="Enable mixed precision when CUDA is available")
     parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable mixed precision")
-    parser.add_argument("--patience", type=int, default=10, help="Early-stopping patience in epochs; use 0 to disable")
+    parser.add_argument("--patience", type=int, default=0, help="Early-stopping patience in epochs; 0 (default) disables it")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--loss",
