@@ -165,9 +165,9 @@ def plan_resources(
     """Decide thread counts, worker counts and cache size for this run.
 
     ``cpu_budget``/``memory_budget_gb`` are *ceilings*: the plan never exceeds
-    them, and never exceeds what the machine actually has. ``None`` means "use
-    the project default" (4 cores / 15 GB), which is itself clamped to reality,
-    so the same command works on a laptop and on the target box.
+    them, and never exceeds what the machine actually has. A non-positive
+    budget means "use all detected resources", so the same command works on a
+    laptop and on the target box.
     """
     detected_cpus = detect_cpu_count()
     requested_cpus = cpu_budget if cpu_budget is not None and cpu_budget > 0 else DEFAULT_CPU_BUDGET
@@ -296,7 +296,7 @@ def suggest_batch_size(
     base_channels: int,
     memory_budget_gb: float,
     minimum: int = 1,
-    maximum: int = 256,
+    maximum: int = 64,
 ) -> int:
     """Estimate the largest batch that fits the RAM budget.
 
@@ -306,22 +306,20 @@ def suggest_batch_size(
     a starting point for --auto-batch-size, not a hard guarantee.
     """
     import torch
-    # If CUDA is available, we also need to consider VRAM.
-    # The suggest_batch_size function in this project is mostly RAM-based,
-    # but for "Full GPU Support", we should ideally check VRAM too.
     if torch.cuda.is_available():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / _BYTES_PER_GB
-        # Use the smaller of RAM budget vs VRAM
-        memory_budget_gb = min(memory_budget_gb, vram_gb * 0.8)
+        # Keep significant VRAM headroom for model weights, gradients, cuDNN
+        # workspaces, and fragmentation. The estimate is per GPU.
+        memory_budget_gb = min(memory_budget_gb, vram_gb * 0.55)
 
     bytes_per_sample = image_size * image_size * base_channels * 4 * 26
     bytes_per_sample += image_size * image_size * channels * 4 * 4
-    usable = memory_budget_gb * 0.75 * _BYTES_PER_GB # Increased usage factor to 0.75 for "Full Support"
+    usable = memory_budget_gb * 0.60 * _BYTES_PER_GB
     estimate = int(usable // max(bytes_per_sample, 1))
-    
-    # If using DataParallel, we can scale the batch size by the number of GPUs
+
+    # DataParallel takes a global batch, distributed across the visible GPUs.
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
     if num_gpus > 1:
-        estimate = estimate * num_gpus
+        estimate *= num_gpus
 
     return max(minimum, min(maximum, estimate))

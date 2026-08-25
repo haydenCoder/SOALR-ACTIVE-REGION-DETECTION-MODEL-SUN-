@@ -7,36 +7,6 @@ ARCHIVE_NAME="MLMT-CNN_Solar-Active-Regions_Bounding-Box_and_Segmentation_Annota
 ARCHIVE_PATH="${RAW_DIR}/${ARCHIVE_NAME}"
 EXTRACT_ROOT="${RAW_DIR}/zenodo_extract"
 UAD_ROOT="${RAW_DIR}/Solar_data_UAD"
-
-mkdir -p "${RAW_DIR}" "${EXTRACT_ROOT}" "${UAD_ROOT}"
-
-echo "[1/5] Downloading dataset archive from Zenodo..."
-if [[ ! -f "${ARCHIVE_PATH}" ]]; then
-  wget -O "${ARCHIVE_PATH}" "${ZENODO_URL}"
-else
-  echo "Archive already exists at ${ARCHIVE_PATH}; skipping download."
-fi
-
-echo "[2/5] Extracting outer ZIP..."
-SEVEN_ZIP_CMD="$(ensure_7zz)"
-if [[ -n "${SEVEN_ZIP_CMD}" ]]; then
-  "${SEVEN_ZIP_CMD}" x -y -o"${EXTRACT_ROOT}" "${ARCHIVE_PATH}" >/dev/null
-else
-  unzip -o "${ARCHIVE_PATH}" -d "${EXTRACT_ROOT}" >/dev/null
-fi
-
-INNER_ROOT="$(find "${EXTRACT_ROOT}" -maxdepth 1 -type d -name 'MLMT-CNN_*' | head -n 1)"
-if [[ -z "${INNER_ROOT}" ]]; then
-  echo "Could not locate extracted dataset directory inside ${EXTRACT_ROOT}" >&2
-  exit 1
-fi
-
-SOURCE_UAD="${INNER_ROOT}/Solar_data_UAD"
-if [[ ! -d "${SOURCE_UAD}" ]]; then
-  echo "Could not locate Solar_data_UAD inside ${INNER_ROOT}" >&2
-  exit 1
-fi
-
 TOOLS_DIR="${RAW_DIR}/tools"
 NODE_TOOLS_DIR="${TOOLS_DIR}/npm-7zip"
 SEVEN_Z_BIN="${NODE_TOOLS_DIR}/node_modules/7zip-bin-full/linux/x64/7zz"
@@ -55,12 +25,12 @@ ensure_7zz() {
     return
   fi
   if ! command -v npm >/dev/null 2>&1; then
-    echo "npm is required to bootstrap a local 7-Zip binary when 7z is unavailable." >&2
+    echo "7-Zip is required. In Colab run: !apt-get update && apt-get install -y p7zip-full" >&2
     exit 1
   fi
 
   mkdir -p "${NODE_TOOLS_DIR}"
-  echo "Installing standalone 7-Zip binary via npm..."
+  echo "Installing standalone 7-Zip binary via npm..." >&2
   (
     cd "${NODE_TOOLS_DIR}"
     if [[ ! -f package.json ]]; then
@@ -75,37 +45,38 @@ ensure_7zz() {
 extract_archive() {
   local archive="$1"
   local destination="$2"
-  mkdir -p "${destination}"
-  local lower="${archive,,}"
-
-  if [[ "${lower}" == *.zip ]]; then
-    unzip -o "${archive}" -d "${destination}" >/dev/null
-    return
-  fi
-
   local seven_zip_cmd
+
+  mkdir -p "${destination}"
   seven_zip_cmd="$(ensure_7zz)"
-  if [[ -n "${seven_zip_cmd}" ]]; then
-    if "${seven_zip_cmd}" x -y -o"${destination}" "${archive}" >/dev/null; then
-      return
-    fi
-  fi
-
-  if command -v unrar >/dev/null 2>&1; then
-    unrar x -o+ "${archive}" "${destination}/" >/dev/null
-    return
-  fi
-
-  if command -v unrar-free >/dev/null 2>&1; then
-    unrar-free -x "${archive}" "${destination}/" >/dev/null
-    return
-  fi
-
-  echo "Failed to extract ${archive}. Install 7z or unrar." >&2
-  exit 1
+  "${seven_zip_cmd}" x -y -o"${destination}" "${archive}" >/dev/null
 }
 
-echo "[3/5] Extracting UAD channel archives and masks..."
+mkdir -p "${RAW_DIR}" "${EXTRACT_ROOT}" "${UAD_ROOT}"
+
+echo "[1/5] Downloading dataset archive from Zenodo..."
+if [[ ! -f "${ARCHIVE_PATH}" ]]; then
+  wget -O "${ARCHIVE_PATH}" "${ZENODO_URL}"
+else
+  echo "Archive already exists at ${ARCHIVE_PATH}; skipping download."
+fi
+
+echo "[2/5] Extracting outer ZIP with 7-Zip..."
+extract_archive "${ARCHIVE_PATH}" "${EXTRACT_ROOT}"
+
+INNER_ROOT="$(find "${EXTRACT_ROOT}" -maxdepth 1 -type d -name 'MLMT-CNN_*' | head -n 1)"
+if [[ -z "${INNER_ROOT}" ]]; then
+  echo "Could not locate extracted dataset directory inside ${EXTRACT_ROOT}" >&2
+  exit 1
+fi
+
+SOURCE_UAD="${INNER_ROOT}/Solar_data_UAD"
+if [[ ! -d "${SOURCE_UAD}" ]]; then
+  echo "Could not locate Solar_data_UAD inside ${INNER_ROOT}" >&2
+  exit 1
+fi
+
+echo "[3/5] Extracting UAD channel archives and masks with 7-Zip..."
 extract_archive "${SOURCE_UAD}/training_images_171.rar" "${UAD_ROOT}/training_images_171"
 extract_archive "${SOURCE_UAD}/training_images_195.rar" "${UAD_ROOT}/training_images_195"
 extract_archive "${SOURCE_UAD}/training_images_284.rar" "${UAD_ROOT}/training_images_284"

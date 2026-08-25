@@ -72,6 +72,14 @@ class ModelEma:
     def state_dict(self) -> dict:
         return {**{k: v.clone() for k, v in self.shadow.items()}, **self.buffers}
 
+    def load_state_dict(self, state_dict: dict, updates: int = 0) -> None:
+        """Restore EMA weights saved by a checkpoint."""
+        model_state = self.shadow | self.buffers
+        for name, value in state_dict.items():
+            if name in model_state:
+                model_state[name].copy_(value)
+        self.updates = updates
+
     def copy_to(self, model: nn.Module) -> dict:
         """Load EMA weights into ``model``, returning the previous state."""
         backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -371,7 +379,7 @@ class Trainer:
             norm_groups=norm_groups,
             deep_supervision=deep_supervision,
         )
-        
+
         if torch.cuda.device_count() > 1:
             print(f"[GPU] Using {torch.cuda.device_count()} GPUs with DataParallel")
             self.model = nn.DataParallel(self.raw_model)
@@ -398,6 +406,8 @@ class Trainer:
         )
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
         self.criterion = build_loss(loss_name, deep_supervision=deep_supervision)
+        self.best_score = -math.inf
+        self.epochs_without_improvement = 0
 
         self._write_run_metadata()
 
@@ -417,18 +427,27 @@ class Trainer:
 
     def fit(self) -> None:
         start_epoch = 1
-        best_score = -math.inf
-        epochs_without_improvement = 0
 
         if self.resume and self.last_checkpoint_path.exists():
             print(f"Resuming from checkpoint: {self.last_checkpoint_path}")
             checkpoint = torch.load(self.last_checkpoint_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint["model_state_dict"])
+            # Checkpoints deliberately save the unwrapped model so they work
+            # across one-GPU and DataParallel runs.
+            self.raw_model.load_state_dict(checkpoint["model_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if self.ema is not None and "ema_state_dict" in checkpoint:
+                self.ema.load_state_dict(
+                    checkpoint["ema_state_dict"], checkpoint.get("ema_updates", 0)
+                )
             start_epoch = checkpoint["metrics"]["epoch"] + 1
-            best_score = checkpoint["metrics"].get("val_dice", -math.inf)
+            self.best_score = checkpoint.get("best_score", checkpoint["metrics"].get("val_dice", -math.inf))
+            self.epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
             print(f"Starting from epoch {start_epoch}")
+
+        if start_epoch > self.epochs:
+            print(f"Training is already complete at epoch {start_epoch - 1}; increase --epochs to continue.")
+            return
 
         for epoch in range(start_epoch, self.epochs + 1):
             start = perf_counter()
@@ -460,14 +479,14 @@ class Trainer:
                 cache_hit_rate=self._cache_hit_rate(),
             )
             self._append_metrics(metrics)
-            self._save_checkpoint(self.last_checkpoint_path, metrics)
 
-            if val_dice > best_score:
-                best_score = val_dice
-                epochs_without_improvement = 0
+            if val_dice > self.best_score:
+                self.best_score = val_dice
+                self.epochs_without_improvement = 0
                 self._save_checkpoint(self.best_checkpoint_path, metrics)
             else:
-                epochs_without_improvement += 1
+                self.epochs_without_improvement += 1
+            self._save_checkpoint(self.last_checkpoint_path, metrics)
 
             print(
                 f"epoch={epoch:03d} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
@@ -476,7 +495,7 @@ class Trainer:
                 f"cache_hit={metrics.cache_hit_rate:.2f}"
             )
 
-            if self.patience > 0 and epochs_without_improvement >= self.patience:
+            if self.patience > 0 and self.epochs_without_improvement >= self.patience:
                 print(f"Early stopping triggered after {epoch} epochs.")
                 break
 
@@ -568,9 +587,12 @@ class Trainer:
             "tta": self.tta,
             "deep_supervision": self.deep_supervision,
         }
+        payload["best_score"] = self.best_score
+        payload["epochs_without_improvement"] = self.epochs_without_improvement
         if self.ema is not None:
             # The EMA weights are the ones that were validated, so store them
             # separately rather than overwriting the raw weights (which are
             # still needed to resume training).
             payload["ema_state_dict"] = self.ema.state_dict()
+            payload["ema_updates"] = self.ema.updates
         torch.save(payload, path)

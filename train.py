@@ -174,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 import subprocess
 
+
 def bootstrap_data() -> str:
     manifest_path = Path("data/processed/uad_manifest.csv")
     if manifest_path.exists():
@@ -183,7 +184,7 @@ def bootstrap_data() -> str:
     # Detect free disk space in GB
     _, _, free_bytes = shutil.disk_usage(".")
     free_gb = free_bytes / (1024**3)
-    
+
     print(f"Detected {free_gb:.1f} GB free disk space.")
 
     print("Manifest not found. Auto-downloading and preparing data...")
@@ -194,21 +195,11 @@ def bootstrap_data() -> str:
     else:
         print("Not enough disk space for UAD dataset (>15GB required).")
 
-    # 2. Download additional data if space allows (targeting expansion up to 100GB total)
-    _, _, free_bytes = shutil.disk_usage(".")
-    free_gb = free_bytes / (1024**3)
-    
-    if free_gb > 20 and Path("scripts/download_real_nasa_samples.sh").exists():
-         print("Extra space detected. Downloading additional NASA samples...")
-         subprocess.run(["bash", "scripts/download_real_nasa_samples.sh"], check=False)
+    # The optional sample scripts contain unlabelled demonstration files. They
+    # cannot be added to this segmentation manifest safely, so do not download
+    # them automatically or spend the user's Colab disk quota on unused data.
 
-    _, _, free_bytes = shutil.disk_usage(".")
-    free_gb = free_bytes / (1024**3)
-    if free_gb > 40 and Path("scripts/download_smarp_sample.sh").exists():
-         print("Plenty of space detected. Downloading SMARP samples...")
-         subprocess.run(["bash", "scripts/download_smarp_sample.sh"], check=False)
-
-    # 3. Prepare manifest
+    # 2. Prepare manifest
     print("Preparing manifest...")
     subprocess.run([
         sys.executable, "scripts/prepare_uad_manifest.py",
