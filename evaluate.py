@@ -67,8 +67,11 @@ def main() -> None:
         masks = masks.to(device, non_blocking=True)
         with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
             logits = model(images)
-            probs = torch.sigmoid(logits)
-            loss = torch.nn.functional.binary_cross_entropy(probs.clamp(1e-6, 1 - 1e-6), masks)
+        # BCE requires float32 here; compute it outside CUDA autocast.
+        logits = logits.float()
+        masks = masks.float()
+        probs = torch.sigmoid(logits)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, masks)
         dice, iou = compute_metrics_from_probs(probs, masks)
         total_dice += dice
         total_iou += iou
