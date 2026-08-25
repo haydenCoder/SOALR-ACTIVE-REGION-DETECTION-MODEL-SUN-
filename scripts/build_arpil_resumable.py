@@ -53,6 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--sampling", choices=["random", "sequential"], default="random",
         help="Choose diverse random official frames (default) or chronological rows",
     )
+    parser.add_argument(
+        "--selection-file", default=None,
+        help="Optional JSON file that freezes the selected source-frame IDs across Colab sessions",
+    )
     parser.add_argument("--patch-size", type=int, default=512)
     parser.add_argument("--stride", type=int, default=512)
     parser.add_argument("--min-mask-fraction", type=float, default=0.0025)
@@ -148,10 +152,32 @@ def main() -> None:
 
     rows = read_csv_rows(MASK_SPLIT_URLS[args.split])
     rows = [row for row in rows if row.get("present", "0") not in {"0", "0.0", "", None} and row.get("file_path")]
-    pending = [row for row in rows if frame_id(row) not in completed]
-    if args.sampling == "random":
-        random.Random(args.seed).shuffle(pending)
-    pending = pending[args.start_index : args.start_index + args.max_frames]
+    rows_by_id = {frame_id(row): row for row in rows}
+    if args.selection_file:
+        selection_path = Path(args.selection_file)
+        if selection_path.exists():
+            selected_ids = json.loads(selection_path.read_text(encoding="utf-8"))["frame_ids"]
+            selected_rows = [rows_by_id[identifier] for identifier in selected_ids if identifier in rows_by_id]
+            print(f"Using frozen selection: {selection_path} ({len(selected_rows)} source frames)")
+        else:
+            selected_rows = list(rows)
+            if args.sampling == "random":
+                random.Random(args.seed).shuffle(selected_rows)
+            selected_rows = selected_rows[args.start_index : args.start_index + args.max_frames]
+            selection_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = selection_path.with_suffix(selection_path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps({"split": args.split, "seed": args.seed, "frame_ids": [frame_id(row) for row in selected_rows]}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(selection_path)
+            print(f"Created frozen selection: {selection_path} ({len(selected_rows)} source frames)")
+        pending = [row for row in selected_rows if frame_id(row) not in completed]
+    else:
+        pending = [row for row in rows if frame_id(row) not in completed]
+        if args.sampling == "random":
+            random.Random(args.seed).shuffle(pending)
+        pending = pending[args.start_index : args.start_index + args.max_frames]
 
     free_gb = shutil.disk_usage(output_dir).free / (1024 ** 3)
     print(f"Local free disk: {free_gb:.1f} GB (reserve: {args.min_free_disk_gb:.1f} GB)")
