@@ -56,6 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mask-key", default="union_with_intersect")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--min-free-disk-gb", type=float, default=15.0,
+        help="Stop safely before processing another frame when local free disk falls below this reserve (default: 15 GB)",
+    )
     return parser
 
 
@@ -143,8 +147,15 @@ def main() -> None:
     pending = [row for row in rows if frame_id(row) not in completed]
     pending = pending[args.start_index : args.start_index + args.max_frames]
 
+    free_gb = shutil.disk_usage(output_dir).free / (1024 ** 3)
+    print(f"Local free disk: {free_gb:.1f} GB (reserve: {args.min_free_disk_gb:.1f} GB)")
     print(f"Previously completed frames: {len(completed)}")
     print(f"New frames selected this run: {len(pending)}")
+    if free_gb < args.min_free_disk_gb:
+        raise SystemExit(
+            f"Only {free_gb:.1f} GB is free; refusing to start below the "
+            f"{args.min_free_disk_gb:.1f} GB safety reserve. Free space or lower --min-free-disk-gb deliberately."
+        )
     if not pending:
         write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed)
         print("No new frames remain for this selection; nothing was downloaded twice.")
@@ -159,6 +170,14 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="arpil_resume_") as tmp:
         temporary_dir = Path(tmp)
         for index, row in enumerate(pending, start=1):
+            free_gb = shutil.disk_usage(output_dir).free / (1024 ** 3)
+            if free_gb < args.min_free_disk_gb:
+                print(
+                    f"Stopping safely: {free_gb:.1f} GB free is below the "
+                    f"{args.min_free_disk_gb:.1f} GB reserve. Completed frames remain saved."
+                )
+                write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed)
+                return
             timestamp = frame_id(row)
             core_key = core_key_from_mask_path(row["file_path"])
             nc_path = temporary_dir / f"{timestamp}.nc"
