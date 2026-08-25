@@ -49,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channels", nargs="+", default=DEFAULT_CHANNELS)
     parser.add_argument("--max-frames", type=int, default=24, help="New source frames to process in this invocation")
     parser.add_argument("--start-index", type=int, default=0, help="Skip this many unprocessed official rows")
+    parser.add_argument(
+        "--sampling", choices=["random", "sequential"], default="random",
+        help="Choose diverse random official frames (default) or chronological rows",
+    )
     parser.add_argument("--patch-size", type=int, default=512)
     parser.add_argument("--stride", type=int, default=512)
     parser.add_argument("--min-mask-fraction", type=float, default=0.0025)
@@ -145,10 +149,13 @@ def main() -> None:
     rows = read_csv_rows(MASK_SPLIT_URLS[args.split])
     rows = [row for row in rows if row.get("present", "0") not in {"0", "0.0", "", None} and row.get("file_path")]
     pending = [row for row in rows if frame_id(row) not in completed]
+    if args.sampling == "random":
+        random.Random(args.seed).shuffle(pending)
     pending = pending[args.start_index : args.start_index + args.max_frames]
 
     free_gb = shutil.disk_usage(output_dir).free / (1024 ** 3)
     print(f"Local free disk: {free_gb:.1f} GB (reserve: {args.min_free_disk_gb:.1f} GB)")
+    print(f"Frame sampling: {args.sampling}")
     print(f"Previously completed frames: {len(completed)}")
     print(f"New frames selected this run: {len(pending)}")
     if free_gb < args.min_free_disk_gb:
