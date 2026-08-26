@@ -24,6 +24,13 @@ from pathlib import Path
 DEFAULT_MEMORY_BUDGET_GB = 0.0
 DEFAULT_CPU_BUDGET = 0
 
+#: Automatic headroom reserved so the OS and other apps stay responsive while
+#: training saturates the machine. Applied only when the corresponding budget
+#: is left at its "auto" default (<= 0); an explicit --cpu-budget or
+#: --memory-budget-gb always wins. A value of 0 disables the reserve.
+DEFAULT_CPU_HEADROOM = 2
+DEFAULT_MEMORY_HEADROOM_GB = 2.0
+
 #: Environment variables read by the numeric libraries at import time.
 _THREAD_ENV_VARS = (
     "OMP_NUM_THREADS",
@@ -161,25 +168,29 @@ def plan_resources(
     dataloader_workers: int | None = None,
     cache_fraction: float = 0.45,
     use_cuda: bool = False,
+    cpu_headroom: int = DEFAULT_CPU_HEADROOM,
+    memory_headroom_gb: float = DEFAULT_MEMORY_HEADROOM_GB,
 ) -> ResourcePlan:
     """Decide thread counts, worker counts and cache size for this run.
 
     ``cpu_budget``/``memory_budget_gb`` are *ceilings*: the plan never exceeds
     them, and never exceeds what the machine actually has. A non-positive
-    budget means "use all detected resources", so the same command works on a
-    laptop and on the target box.
+    budget means "auto" and selects ``detected - headroom``, so the machine
+    stays usable (e.g. 8-core laptop -> 6 training cores) while still being
+    saturated. Pass an explicit positive budget to override.
     """
     detected_cpus = detect_cpu_count()
-    requested_cpus = cpu_budget if cpu_budget is not None and cpu_budget > 0 else DEFAULT_CPU_BUDGET
+    requested_cpus = cpu_budget if cpu_budget is not None and cpu_budget > 0 else 0
     if requested_cpus <= 0:
-        effective_cpus = detected_cpus
+        # Auto: keep the requested headroom free for the OS / other apps.
+        effective_cpus = max(1, detected_cpus - max(0, cpu_headroom))
     else:
         effective_cpus = max(1, min(requested_cpus, detected_cpus))
 
     detected_memory = detect_memory_gb()
-    requested_memory = memory_budget_gb if memory_budget_gb is not None and memory_budget_gb > 0 else DEFAULT_MEMORY_BUDGET_GB
+    requested_memory = memory_budget_gb if memory_budget_gb is not None and memory_budget_gb > 0 else 0.0
     if requested_memory <= 0:
-        effective_memory = detected_memory
+        effective_memory = max(0.5, detected_memory - max(0.0, memory_headroom_gb))
     else:
         effective_memory = max(0.5, min(requested_memory, detected_memory))
 
@@ -247,6 +258,20 @@ def preferred_device() -> str:
     return "cpu"
 
 
+def describe_accelerator() -> str:
+    """One-line human summary of the accelerator the run will use."""
+    import torch
+
+    device = preferred_device()
+    if device == "cuda":
+        name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / _BYTES_PER_GB
+        return f"GPU: CUDA {name} ({vram:.1f} GB VRAM)"
+    if device == "mps":
+        return "GPU: Apple Metal (MPS) using unified memory"
+    return "GPU: none detected (CPU only)"
+
+
 def apply_torch_runtime(plan: ResourcePlan) -> None:
     """Apply the plan to an already-imported torch and enable CPU fast paths."""
     import torch
@@ -277,6 +302,8 @@ def configure_runtime(
     dataloader_workers: int | None = None,
     cache_fraction: float = 0.45,
     use_cuda: bool = False,
+    cpu_headroom: int = DEFAULT_CPU_HEADROOM,
+    memory_headroom_gb: float = DEFAULT_MEMORY_HEADROOM_GB,
 ) -> ResourcePlan:
     """Plan and apply the resource configuration in one call."""
     plan = plan_resources(
@@ -285,6 +312,8 @@ def configure_runtime(
         dataloader_workers=dataloader_workers,
         cache_fraction=cache_fraction,
         use_cuda=use_cuda,
+        cpu_headroom=cpu_headroom,
+        memory_headroom_gb=memory_headroom_gb,
     )
     apply_thread_environment(plan)
     apply_torch_runtime(plan)

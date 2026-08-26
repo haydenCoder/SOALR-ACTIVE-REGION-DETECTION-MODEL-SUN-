@@ -11,7 +11,9 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from solar_ar.runtime import (
     DEFAULT_CPU_BUDGET,
+    DEFAULT_CPU_HEADROOM,
     DEFAULT_MEMORY_BUDGET_GB,
+    DEFAULT_MEMORY_HEADROOM_GB,
     plan_resources,
     suggest_batch_size,
 )
@@ -104,6 +106,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.45,
         help="Fraction of the memory budget used to cache decoded samples in RAM.",
+    )
+    hardware.add_argument(
+        "--cpu-headroom",
+        type=int,
+        default=DEFAULT_CPU_HEADROOM,
+        help=(
+            "Cores to leave free for the OS when --cpu-budget is auto (<=0). "
+            f"Default: {DEFAULT_CPU_HEADROOM}; 0 uses every detected core."
+        ),
+    )
+    hardware.add_argument(
+        "--memory-headroom-gb",
+        type=float,
+        default=DEFAULT_MEMORY_HEADROOM_GB,
+        help=(
+            "RAM in GB to leave free when --memory-budget-gb is auto (<=0). "
+            f"Default: {DEFAULT_MEMORY_HEADROOM_GB}; 0 uses all detected RAM."
+        ),
     )
     hardware.add_argument(
         "--auto-batch-size",
@@ -233,6 +253,8 @@ def main() -> None:
             memory_budget_gb=args.memory_budget_gb,
             cache_fraction=args.cache_fraction,
             use_cuda=torch.cuda.is_available(),
+            cpu_headroom=args.cpu_headroom,
+            memory_headroom_gb=args.memory_headroom_gb,
         )
         batch_size = suggest_batch_size(
             image_size=args.image_size,
@@ -271,6 +293,8 @@ def main() -> None:
         cpu_budget=args.cpu_budget,
         memory_budget_gb=args.memory_budget_gb,
         cache_fraction=args.cache_fraction,
+        cpu_headroom=args.cpu_headroom,
+        memory_headroom_gb=args.memory_headroom_gb,
         deep_supervision=args.deep_supervision,
         model_depth=args.model_depth,
         residual=args.residual,

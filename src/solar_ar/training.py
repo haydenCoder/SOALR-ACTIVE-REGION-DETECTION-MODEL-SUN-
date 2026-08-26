@@ -17,7 +17,14 @@ from tqdm import tqdm
 
 from solar_ar.data import SolarActiveRegionDataset
 from solar_ar.models import AttentionUNet
-from solar_ar.runtime import configure_runtime, process_memory_gb, preferred_device
+from solar_ar.runtime import (
+    DEFAULT_CPU_HEADROOM,
+    DEFAULT_MEMORY_HEADROOM_GB,
+    configure_runtime,
+    describe_accelerator,
+    preferred_device,
+    process_memory_gb,
+)
 from solar_ar.tta import tta_predict
 
 
@@ -261,6 +268,8 @@ class Trainer:
         cpu_budget: int | None = None,
         memory_budget_gb: float | None = None,
         cache_fraction: float = 0.45,
+        cpu_headroom: int = DEFAULT_CPU_HEADROOM,
+        memory_headroom_gb: float = DEFAULT_MEMORY_HEADROOM_GB,
         deep_supervision: bool = False,
         model_depth: int = 4,
         residual: bool = True,
@@ -284,8 +293,11 @@ class Trainer:
             dataloader_workers=num_workers if num_workers and num_workers > 0 else None,
             cache_fraction=cache_fraction,
             use_cuda=self.device.type == "cuda",
+            cpu_headroom=cpu_headroom,
+            memory_headroom_gb=memory_headroom_gb,
         )
         print(self.resource_plan.describe())
+        print(describe_accelerator())
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.output_dir / "metrics.jsonl"
