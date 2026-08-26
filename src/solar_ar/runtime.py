@@ -27,9 +27,11 @@ DEFAULT_CPU_BUDGET = 0
 #: Automatic headroom reserved so the OS and other apps stay responsive while
 #: training saturates the machine. Applied only when the corresponding budget
 #: is left at its "auto" default (<= 0); an explicit --cpu-budget or
-#: --memory-budget-gb always wins. A value of 0 disables the reserve.
-DEFAULT_CPU_HEADROOM = 2
-DEFAULT_MEMORY_HEADROOM_GB = 2.0
+#: --memory-budget-gb always wins. The default is 0 (grab everything), which is
+#: the right choice for a dedicated training box you are not using meanwhile;
+#: raise it (e.g. 2 cores / 2 GB) only if you need the machine to stay usable.
+DEFAULT_CPU_HEADROOM = 0
+DEFAULT_MEMORY_HEADROOM_GB = 0.0
 
 #: Environment variables read by the numeric libraries at import time.
 _THREAD_ENV_VARS = (

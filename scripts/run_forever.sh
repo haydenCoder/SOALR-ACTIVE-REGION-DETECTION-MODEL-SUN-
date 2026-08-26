@@ -4,8 +4,9 @@
 # -----------------------------------------------------------------------------
 # A fire-and-forget training loop for your Mac (or any machine). It:
 #
-#   1. Detects your hardware (CPU cores, RAM, free disk) and uses it sensibly:
-#        - training uses (cores - 2) and (RAM - headroom) automatically,
+#   1. Detects your hardware (CPU cores, RAM, free disk) and uses ALL of it
+#      (no headroom — the machine will feel sluggish, which is fine because
+#      you are not using it while it trains),
 #        - patch size is chosen from RAM (512 if >=12 GB, else 256),
 #        - how much data to download is chosen from free disk.
 #   2. Downloads ARPIL tiles a little at a time  (resumes where it left off),
@@ -13,10 +14,14 @@
 #   4. Evaluates it (pixel Dice/IoU  AND  object-detection F1),
 #   5. Optionally evaluates on the OFFICIAL 2020-2024 test split,
 #   6. Cleans up junk (never your data or checkpoints),
-#   7. Repeats forever, adding more frames each pass.
+#   7. Logs EVERYTHING to run_forever.log (timings, resources, metrics),
+#   8. Repeats forever, adding more frames each pass.
 #
 # Usage:
 #     bash scripts/run_forever.sh
+#
+# On macOS, run it under caffeinate so the machine never sleeps mid-training:
+#     caffeinate -i bash scripts/run_forever.sh
 #
 # - Stop it any time with Ctrl-C. Re-run it later and it picks up exactly
 #   where it stopped (every step is resumable).
@@ -82,9 +87,9 @@ setup() {
     "$PY" -c 'import torch; print("torch", torch.__version__, "| mps:", torch.backends.mps.is_available(), "| cuda:", torch.cuda.is_available())' 2>&1 | tee -a "$LOG"
 }
 
-# Detect CPU cores, RAM and derive the patch size + CPU budget to use.
-# Training itself already applies (cores - 2) and RAM headroom internally
-# (see src/solar_ar/runtime.py); here we decide the *download* shape.
+# Detect CPU cores, RAM and derive the patch size to use. Training is launched
+# with --cpu-headroom 0 --memory-headroom-gb 0 so it grabs EVERY core and all
+# RAM (see src/solar_ar/runtime.py); here we decide the *download* shape.
 detect_hardware() {
     local hw
     hw="$("$PY" - <<'PY'
@@ -97,7 +102,6 @@ except (AttributeError, ValueError, OSError):
 patch = 512 if ram_gb >= 12.0 else 256
 print(f"cpus={cpus}")
 print(f"ram_gb={ram_gb}")
-print(f"cpu_budget={max(1, cpus - 2)}")
 print(f"patch={patch}")
 PY
 )"
@@ -118,7 +122,7 @@ PY
     fi
 
     log "Hardware: $cpus cores | ${ram_gb} GB RAM | ~$disk_free GB free disk"
-    log "Decisions: train CPU budget=$cpu_budget | patch size=$PATCH_SIZE | max total frames=$MAX_TOTAL_FRAMES"
+    log "Decisions: use ALL $cpus cores + ${ram_gb} GB RAM | patch size=$PATCH_SIZE | max total frames=$MAX_TOTAL_FRAMES"
 }
 
 # Run one step. Log its output; return success/failure without aborting.
@@ -141,6 +145,30 @@ cleanup() {
     log "Disk: $(free_gb) GB free"
 }
 
+# Log the key numbers from a metrics JSON so you can skim the log without
+# opening each file. Reads a handful of known keys; extra keys are ignored.
+summarize_json() {
+    local label="$1" file="$2"
+    [[ -f "$file" ]] || { log "  $label: (no file)"; return; }
+    "$PY" - "$label" "$file" <<'PY'
+import json, sys
+label, path = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(path))
+except Exception as e:
+    print(f"  {label}: unreadable ({e})")
+    sys.exit(0)
+keys = ["dice", "iou", "bce_loss", "precision", "recall", "f1", "ap", "ap50",
+        "tp", "fp", "fn", "samples"]
+parts = []
+for k in keys:
+    if k in d:
+        v = d[k]
+        parts.append(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}")
+print(f"  {label}: " + ", ".join(parts))
+PY
+}
+
 # --- main loop --------------------------------------------------------------
 
 setup
@@ -148,7 +176,9 @@ detect_hardware
 CYCLE=1
 
 while [[ $CYCLE -le $MAX_CYCLES ]]; do
+    CYCLE_START=$(date +%s)
     log "==================== Cycle $CYCLE ===================="
+    log "Start: $(date)"
     FRAMES=$(completed_frames "$DATA_DIR")
 
     # 1) Download more tiles (skip once we hit the cap, or when disk is tight).
@@ -180,6 +210,7 @@ while [[ $CYCLE -le $MAX_CYCLES ]]; do
     fi
 
     # 2) Train (fresh run each cycle on the growing dataset — robust and simple).
+    #    Explicitly use every core and all RAM (the machine is dedicated).
     OUT="$RESULTS_DIR/cycle_$CYCLE"
     run "train (cycle $CYCLE, $EPOCHS epochs)" \
         "$PY" "$REPO_DIR/train.py" \
@@ -187,6 +218,7 @@ while [[ $CYCLE -le $MAX_CYCLES ]]; do
         --channels "$CHANNELS" \
         --image-size "$PATCH_SIZE" \
         --epochs "$EPOCHS" --patience 0 \
+        --cpu-headroom 0 --memory-headroom-gb 0 \
         --output-dir "$OUT"
 
     # 3) Evaluate on the validation split (pixel + object metrics).
@@ -236,6 +268,19 @@ while [[ $CYCLE -le $MAX_CYCLES ]]; do
 
     # 5) Cleanup junk and report disk usage.
     cleanup
+
+    # 6) Summary of this cycle's results + wall-clock time.
+    if [[ -d "$OUT" ]]; then
+        summarize_json "val pixel Dice/IoU" "$OUT/pixel_metrics.json"
+        summarize_json "val object-detection" "$OUT/detection_metrics.json"
+        if [[ "$EVAL_TEST_SPLIT" == "1" ]]; then
+            summarize_json "TEST pixel Dice/IoU" "$OUT/test_pixel_metrics.json"
+            summarize_json "TEST object-detection" "$OUT/test_detection_metrics.json"
+        fi
+    fi
+    CYCLE_END=$(date +%s)
+    log "Cycle $CYCLE done in $(( (CYCLE_END - CYCLE_START) / 60 )) min $(( (CYCLE_END - CYCLE_START) % 60 )) sec."
+    log "=========================================================="
 
     CYCLE=$((CYCLE+1))
 done

@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CPU_HEADROOM,
         help=(
             "Cores to leave free for the OS when --cpu-budget is auto (<=0). "
-            f"Default: {DEFAULT_CPU_HEADROOM}; 0 uses every detected core."
+            f"Default: {DEFAULT_CPU_HEADROOM} (0 = use every detected core)."
         ),
     )
     hardware.add_argument(
@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MEMORY_HEADROOM_GB,
         help=(
             "RAM in GB to leave free when --memory-budget-gb is auto (<=0). "
-            f"Default: {DEFAULT_MEMORY_HEADROOM_GB}; 0 uses all detected RAM."
+            f"Default: {DEFAULT_MEMORY_HEADROOM_GB} (0 = use all detected RAM)."
         ),
     )
     hardware.add_argument(
