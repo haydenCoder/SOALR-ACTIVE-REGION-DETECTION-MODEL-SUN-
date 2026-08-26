@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from solar_ar.data import SolarActiveRegionDataset
 from solar_ar.models import AttentionUNet
-from solar_ar.runtime import configure_runtime, process_memory_gb
+from solar_ar.runtime import configure_runtime, process_memory_gb, preferred_device
 from solar_ar.tta import tta_predict
 
 
@@ -274,7 +274,7 @@ class Trainer:
         resume: bool = False,
     ) -> None:
         seed_everything(seed)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(preferred_device())
         self.resume = resume
 
         # Detect and claim the CPU/RAM budget before building anything heavy.

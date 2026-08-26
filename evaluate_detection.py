@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from solar_ar.data import SolarActiveRegionDataset
 from solar_ar.models import AttentionUNet
+from solar_ar.runtime import preferred_device
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,7 +92,7 @@ def average_precision(predictions: list[tuple[float, bool]], targets: int) -> fl
 @torch.no_grad()
 def main() -> None:
     args = build_parser().parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(preferred_device())
     dataset = SolarActiveRegionDataset(
         manifest_path=args.manifest,
         channels=args.channels,

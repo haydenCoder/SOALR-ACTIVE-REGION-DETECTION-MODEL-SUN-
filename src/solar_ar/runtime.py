@@ -231,6 +231,22 @@ def apply_thread_environment(plan: ResourcePlan) -> None:
     os.environ.setdefault("KMP_BLOCKTIME", "1")
 
 
+def preferred_device() -> str:
+    """Return the best available accelerator: ``cuda``, ``mps``, or ``cpu``.
+
+    Apple Silicon exposes its GPU through the Metal ``mps`` backend rather than
+    CUDA; this lets the trainer and evaluator share one device decision so the
+    same code runs on a Colab T4 (cuda) and a local Mac (mps) without edits.
+    """
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def apply_torch_runtime(plan: ResourcePlan) -> None:
     """Apply the plan to an already-imported torch and enable CPU fast paths."""
     import torch
