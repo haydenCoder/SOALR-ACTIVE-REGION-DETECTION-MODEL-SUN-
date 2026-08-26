@@ -37,6 +37,10 @@ def normalize_key(path: Path) -> str:
     stem = path.stem.lower()
     stem = re.sub(r"(mask|label|labels|image|images)", "_", stem)
     stem = re.sub(r"(171|195|284|304)", "_", stem)
+    # UAD image RARs prefix frames with ``VeF-`` while their corresponding
+    # PNG masks start directly with the numeric frame id. It is metadata, not
+    # part of the sample identity, so remove it before matching.
+    stem = re.sub(r"(^|_)vef_?", "_", stem)
     stem = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
     return stem or path.stem.lower()
 
