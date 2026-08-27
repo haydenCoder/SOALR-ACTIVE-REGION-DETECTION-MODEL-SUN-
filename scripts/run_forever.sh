@@ -184,17 +184,73 @@ if [[ "$(uname -s)" == "Linux" && -n "$(command -v systemd-inhibit)" ]]; then
     fi
 fi
 
+# Pick the best available Python 3: prefer a Homebrew build (3.10+) over the
+# macOS system Python 3.9, which is EOL and only gets older, older wheels.
+pick_python() {
+    local cand
+    for cand in python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# True iff the venv actually has every module the pipeline imports.
+deps_ok() {
+    "$PY" -c 'import torch, numpy, h5py, netCDF4, astropy, PIL, boto3, requests, scipy, tqdm' >/dev/null 2>&1
+}
+
+# Install (or reinstall) dependencies into the venv, VERIFY the result, and
+# put any failure where you can see it: the console AND the log.
+install_deps() {
+    local t0
+    local pipout="$RESULTS_DIR/.pip_install.log"
+    t0=$(date +%s)
+    if ! "$PY" -m pip --version >>"$LOG" 2>&1; then
+        log "venv has no pip — bootstrapping with ensurepip ..."
+        "$PY" -m ensurepip --upgrade >>"$LOG" 2>&1
+    fi
+    "$PY" -m pip install --upgrade pip >"$pipout" 2>&1
+    if "$PY" -m pip install -r "$REPO_DIR/requirements.txt" >>"$pipout" 2>&1; then
+        cat "$pipout" >>"$LOG"
+        if deps_ok; then
+            log "✔ Dependencies installed and verified in $(dur $t0 $(date +%s))."
+            rm -f "$pipout"
+            return 0
+        fi
+        log "✖ pip install finished but the import check failed — last 15 lines of pip output:"
+    else
+        log "✖ Dependency install FAILED. Last 15 lines of pip output:"
+    fi
+    tail -n 15 "$pipout" | sed 's/^/      | /' | tee -a "$LOG"
+    log "  The next cycle will retry automatically. If it keeps failing:"
+    log "    1) rm -rf \"$REPO_DIR/.venv\" and re-run, or"
+    log "    2) install a newer Python first (macOS system Python 3.9 is EOL):"
+    log "       brew install python@3.11    (then re-run this script)"
+    return 1
+}
+
 setup() {
     if [[ ! -x "$PY" ]]; then
         log "Creating Python venv at $REPO_DIR/.venv ..."
-        local t0; t0=$(date +%s)
-        python3 -m venv "$REPO_DIR/.venv"
-        "$PY" -m pip install --upgrade pip >/dev/null
-        "$PY" -m pip install -r "$REPO_DIR/requirements.txt" >>"$LOG" 2>&1
-        log "Dependencies installed in $(dur $t0 $(date +%s))."
+        local pybin
+        pybin="$(pick_python || echo python3)"
+        log "Python: $(command -v "$pybin" 2>/dev/null || echo "$pybin")  ($("$pybin" --version 2>&1))"
+        if ! "$pybin" -m venv "$REPO_DIR/.venv" >>"$LOG" 2>&1; then
+            log "✖ venv creation failed — last 10 lines of $LOG:"
+            tail -n 10 "$LOG" | sed 's/^/      | /' | tee -a "$LOG"
+        fi
+    fi
+    if ! deps_ok; then
+        log "Python dependencies missing or broken — installing into $REPO_DIR/.venv ..."
+        install_deps || log "(install not complete yet — each cycle retries automatically)"
     fi
     log "Python: $("$PY" --version 2>&1)"
-    "$PY" -c 'import torch; print("  torch", torch.__version__, "| mps:", torch.backends.mps.is_available(), "| cuda:", torch.cuda.is_available())' >>"$LOG" 2>&1
+    if deps_ok; then
+        "$PY" -c 'import torch; print("  torch", torch.__version__, "| mps:", torch.backends.mps.is_available(), "| cuda:", torch.cuda.is_available())' >>"$LOG" 2>&1
+    fi
 }
 
 # Detect CPU cores, RAM and derive the patch size to use. Training is launched
@@ -465,6 +521,24 @@ while [[ $CYCLE -le $MAX_CYCLES ]]; do
     hr
     log "CYCLE $CYCLE started — $(date '+%Y-%m-%d %H:%M:%S %Z')"
     log "────────────────────────────────────────────────────────────────────"
+
+    # Auto-repair: if the environment is broken (failed install, partial
+    # download, wiped venv), fix it BEFORE spending a cycle on doomed steps.
+    if [[ ! -x "$PY" ]] || ! deps_ok; then
+        log "Python environment missing or broken — repairing before this cycle ..."
+        if [[ ! -x "$PY" ]]; then
+            pybin="$(pick_python || echo python3)"
+            "$pybin" -m venv "$REPO_DIR/.venv" >>"$LOG" 2>&1
+        fi
+        if install_deps; then
+            log "✔ Environment repaired — continuing with this cycle."
+        else
+            sleep 30
+            CYCLE=$((CYCLE+1))
+            continue
+        fi
+    fi
+
     FRAMES=$(completed_frames "$DATA_DIR")
     log "Frames on disk: $FRAMES / $MAX_TOTAL_FRAMES"
 
