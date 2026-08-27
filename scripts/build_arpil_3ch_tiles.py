@@ -112,13 +112,14 @@ def extract_mask(archive_path: Path, members: dict[str, str], mask_rel_path: str
             shutil.copyfileobj(source, handle)
 
 
-# Multipart download tuning: each ~570 MB frame is pulled as 16 concurrent
-# 16 MB range-requests instead of one slow stream, so a single file already
+# Multipart download tuning: each ~570 MB frame is pulled as 12 concurrent
+# ~48 MB range-requests instead of one slow stream, so a single file already
 # saturates the link; the thread pool on top of that pulls several files at
-# once. (boto3's download_file defaults to 10 x 8 MB.)
+# once. 12 (not 16) keeps the handle count under macOS's 256 default
+# ulimit: 16 workers x 12 parts = 192 part files + masks + tiles < 256.
 S3_TRANSFER = TransferConfig(
-    max_concurrency=16,
-    multipart_chunksize=16 * 1024 * 1024,
+    max_concurrency=12,
+    multipart_chunksize=48 * 1024 * 1024,
     use_threads=True,
 )
 

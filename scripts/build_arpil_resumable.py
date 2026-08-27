@@ -87,6 +87,30 @@ def frame_id(row: dict[str, str]) -> str:
     return Path(row["file_path"]).stem
 
 
+def raise_file_limit() -> None:
+    """Raise the process file-descriptor limit for parallel downloads.
+
+    macOS ships with a 256 soft limit; 16 parallel downloaders each open
+    ~12 multipart part files plus mask/tile handles, which exceeds it and
+    surfaces as "[Errno 24] Too many open files" mid-batch. Raising the soft
+    limit up to the hard limit (10248 on macOS) needs no privileges. If the
+    raise fails we keep going — the 12-part sizing already stays under 256.
+    """
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 4096
+        if 0 < hard < target:
+            target = hard
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard if hard > 0 else target))
+            print(f"Raised file descriptor limit: {soft} -> {target}")
+    except (ImportError, ValueError, OSError) as exc:
+        print(f"Could not raise file descriptor limit ({type(exc).__name__}: {exc}) — continuing; "
+              "downloads are sized to stay under the default limit.")
+
+
 def load_fragment_rows(fragment_dir: Path) -> dict[str, list[dict[str, str]]]:
     result: dict[str, list[dict[str, str]]] = {}
     for path in sorted(fragment_dir.glob("*.csv")):
@@ -150,6 +174,7 @@ def write_combined_manifest(
 
 def main() -> None:
     args = build_parser().parse_args()
+    raise_file_limit()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     image_root = output_dir / "images"
