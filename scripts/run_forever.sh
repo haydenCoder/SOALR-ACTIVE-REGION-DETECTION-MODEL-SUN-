@@ -83,6 +83,11 @@ WATCH_EVERY=300            # resource watchdog interval, seconds
 #     frame is picked up within one epoch. One model that only gets better.
 #   CONTINUOUS=0 — classic batched cycles (download 200 frames -> train -> repeat).
 CONTINUOUS="${CONTINUOUS:-1}"
+# Use 1 when resuming a checkpoint whose stored Dice was measured on a
+# DIFFERENT dataset/representation (e.g. your 50-epoch Drive model trained on
+# full-disk thumbnails, now resumed on 512 tiles). Without it, the old score
+# (0.9535) stays the "best" bar forever and best.pt would never update.
+CALIBRATE_BEST="${CALIBRATE_BEST:-0}"
 
 # Official test-split evaluation (paper-comparable number). Turn on when you
 # want the 2020-2024 test metric; it builds test tiles then evaluates the
@@ -195,7 +200,7 @@ try:
     load = open("/proc/loadavg").read().split()[0]
 except Exception:
     try:
-        load = subprocess.check_output(["sysctl", "-n", "vm.loadavg"]).decode().lstrip("[]").split()[0]
+        load = subprocess.check_output(["sysctl", "-n", "vm.loadavg"]).decode().lstrip("[]{} ").split()[0]
     except Exception:
         load = "?"
 used = None
@@ -604,6 +609,8 @@ if [[ "$CONTINUOUS" == "1" ]]; then
     log "CONTINUOUS mode: background downloader + streaming trainer (Ctrl-C stops both cleanly)."
     downloader_loop &
     DOWNLOADER_PID=$!
+    CALIBRATE_ARG=""
+    [[ "$CALIBRATE_BEST" == "1" ]] && CALIBRATE_ARG="--calibrate-best"
     "$PY" "$REPO_DIR/scripts/train_streaming.py" \
         --manifest "$DATA_DIR/manifest.csv" \
         --channels "$CHANNELS" \
@@ -611,7 +618,8 @@ if [[ "$CONTINUOUS" == "1" ]]; then
         --output-dir "$RESULTS_DIR/continuous" \
         --val-every 2 \
         --status-file "$STATUS" \
-        --cpu-headroom "$CPU_HEADROOM" --memory-budget-gb 0
+        --cpu-headroom "$CPU_HEADROOM" --memory-budget-gb 0 \
+        $CALIBRATE_ARG
     TRAINER_RC=$?
     log "Streaming trainer exited (code $TRAINER_RC) — stopping the downloader."
     kill "$DOWNLOADER_PID" 2>/dev/null

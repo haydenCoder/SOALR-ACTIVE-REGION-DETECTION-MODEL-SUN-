@@ -77,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--memory-budget-gb", type=float, default=0.0, help="0 = all detected RAM")
     p.add_argument("--no-resume", dest="resume", action="store_false", default=True)
     p.add_argument("--no-torch-compile", dest="torch_compile", action="store_false", default=True)
+    p.add_argument(
+        "--calibrate-best",
+        action="store_true",
+        help="After resuming, set the best-Dice bar from the FIRST validation on the "
+             "current data instead of the checkpoint's stored value. Use when resuming a "
+             "checkpoint whose val Dice was measured on a DIFFERENT dataset/representation "
+             "(e.g. a full-disk-thumbnail model resumed on 512 tiles): otherwise the old, "
+             "incomparable score stays the bar and best.pt would never update.",
+    )
     return p
 
 
@@ -116,7 +125,10 @@ def load_last(path: Path, model, optimizer, ema, device) -> tuple[int, float, fl
     return int(epoch), float(best_dice), (float(lr) if lr else None)
 
 
-def save_checkpoint(path: Path, model, optimizer, ema, epoch: int, best_dice: float, channels: list[str]) -> None:
+def save_checkpoint(
+    path: Path, model, optimizer, ema, epoch: int, best_dice: float, channels: list[str],
+    learning_rate: float | None = None,
+) -> None:
     payload = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -124,6 +136,9 @@ def save_checkpoint(path: Path, model, optimizer, ema, epoch: int, best_dice: fl
         "best_dice": best_dice,
         "channels": channels,
     }
+    if learning_rate is not None:
+        # Stored so a resume can re-warm from exactly this run's current LR.
+        payload["learning_rate"] = learning_rate
     if ema is not None:
         payload["ema_state_dict"] = ema.state_dict()
         payload["ema_updates"] = ema.updates
@@ -222,6 +237,11 @@ def main() -> None:
                 flush=True,
             )
     start_epoch = epoch
+    # When resuming a model whose stored Dice came from a different dataset
+    # (e.g. full-disk thumbnails -> 512 tiles), the old bar is meaningless:
+    # calibrate_pending makes the FIRST validation on current data set it.
+    calibrate_pending = bool(args.calibrate_best and (epoch > 0 or resume_lr is not None))
+    current_lr: float | None = None
 
     stop = {"flag": False}
 
@@ -343,12 +363,17 @@ def main() -> None:
             val_dice = dice_sum / max(vb, 1)
             val_iou = iou_sum / max(vb, 1)
             line += f" val_dice={val_dice:.4f} val_iou={val_iou:.4f}"
+            if calibrate_pending:
+                calibrate_pending = False
+                best_dice = val_dice
+                line += f"  (best bar calibrated to current data: {val_dice:.4f})"
             if val_dice > best_dice:
                 best_dice = val_dice
-                save_checkpoint(best_path, model, optimizer, ema, epoch, best_dice, args.channels)
+                save_checkpoint(best_path, model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
                 line += "  ★ new best"
 
-        save_checkpoint(last_path, model, optimizer, ema, epoch, best_dice, args.channels)
+        current_lr = lr
+        save_checkpoint(last_path, model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"epoch": epoch, "loss": avg_loss, "samples": n_train}) + "\n")
         print(f"[stream] {line}", flush=True)
@@ -359,7 +384,7 @@ def main() -> None:
             print("[stream] reached --max-epochs — stopping.", flush=True)
             break
 
-    save_checkpoint(last_path, model, optimizer, ema, epoch, best_dice, args.channels)
+    save_checkpoint(last_path, model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
     print(f"[stream] stopped at epoch {epoch}; checkpoints saved to {out_dir}", flush=True)
 
 
