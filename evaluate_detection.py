@@ -23,7 +23,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from solar_ar.data import SolarActiveRegionDataset
 from solar_ar.models import AttentionUNet
-from solar_ar.runtime import preferred_device
+from solar_ar.runtime import amp_settings, preferred_device
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -93,6 +93,7 @@ def average_precision(predictions: list[tuple[float, bool]], targets: int) -> fl
 def main() -> None:
     args = build_parser().parse_args()
     device = torch.device(preferred_device())
+    autocast_type, amp_enabled, _ = amp_settings(device.type)
     dataset = SolarActiveRegionDataset(
         manifest_path=args.manifest,
         channels=args.channels,
@@ -111,7 +112,7 @@ def main() -> None:
     tp = fp = fn = target_count = 0
     scored_predictions: list[tuple[float, bool]] = []
     for images, targets in loader:
-        with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
+        with torch.amp.autocast(device_type=autocast_type, enabled=amp_enabled):
             probabilities = torch.sigmoid(model(images.to(device, non_blocking=True))).float().cpu().numpy()[:, 0]
         target_arrays = targets.numpy()[:, 0]
         for probability, target in zip(probabilities, target_arrays):

@@ -16,7 +16,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from solar_ar.data import SolarActiveRegionDataset
 from solar_ar.models import AttentionUNet
-from solar_ar.runtime import preferred_device
+from solar_ar.runtime import amp_settings, preferred_device
 from solar_ar.training import compute_metrics_from_probs
 
 
@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     device = torch.device(preferred_device())
+    autocast_type, amp_enabled, _ = amp_settings(device.type)
     dataset = SolarActiveRegionDataset(
         manifest_path=args.manifest,
         channels=args.channels,
@@ -66,7 +67,7 @@ def main() -> None:
     for images, masks in loader:
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
-        with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
+        with torch.amp.autocast(device_type=autocast_type, enabled=amp_enabled):
             logits = model(images)
         # BCE requires float32 here; compute it outside CUDA autocast.
         logits = logits.float()

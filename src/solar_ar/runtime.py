@@ -16,6 +16,7 @@ back a plan the trainer can apply.
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -27,10 +28,11 @@ DEFAULT_CPU_BUDGET = 0
 #: Automatic headroom reserved so the OS and other apps stay responsive while
 #: training saturates the machine. Applied only when the corresponding budget
 #: is left at its "auto" default (<= 0); an explicit --cpu-budget or
-#: --memory-budget-gb always wins. The default is 0 (grab everything), which is
-#: the right choice for a dedicated training box you are not using meanwhile;
-#: raise it (e.g. 2 cores / 2 GB) only if you need the machine to stay usable.
-DEFAULT_CPU_HEADROOM = 0
+#: --memory-budget-gb always wins. The default is 2 cores: the run grabs
+#: maximum power (every core minus two, all RAM) while a Mac/box you keep
+#: working on stays usable. Pass 0 to grab literally every core on a
+#: dedicated training box.
+DEFAULT_CPU_HEADROOM = 2
 DEFAULT_MEMORY_HEADROOM_GB = 0.0
 
 #: Environment variables read by the numeric libraries at import time.
@@ -221,7 +223,10 @@ def plan_resources(
         memory_budget_gb=effective_memory,
         disk_free_gb=detect_disk_gb(),
         dataloader_workers=workers,
-        prefetch_factor=4 if workers > 0 else None,
+        # 8 prefetched batches per worker keeps every core fed: decoding
+        # FITS/HDF5 tiles is the slow part, so workers stay ahead of the model
+        # instead of stalling it between batches.
+        prefetch_factor=8 if workers > 0 else None,
         persistent_workers=workers > 0,
         pin_memory=use_cuda,
         cache_budget_bytes=cache_budget,
@@ -272,6 +277,47 @@ def describe_accelerator() -> str:
     if device == "mps":
         return "GPU: Apple Metal (MPS) using unified memory"
     return "GPU: none detected (CPU only)"
+
+
+@functools.lru_cache(maxsize=1)
+def _mps_autocast_supported() -> bool:
+    """Probe whether this torch build accepts ``autocast(device_type="mps")``.
+
+    MPS autocast (bfloat16) shipped in recent PyTorch releases; on older or
+    CPU-only builds the constructor rejects the device type, so we fall back
+    to plain fp32 instead of crashing the run.
+    """
+    import torch
+
+    try:
+        with torch.amp.autocast(device_type="mps", enabled=False):
+            pass
+        return True
+    except (ValueError, RuntimeError, TypeError):
+        return False
+
+
+def amp_settings(device_type: str, enabled: bool = True) -> tuple[str, bool, bool]:
+    """Decide the mixed-precision setup for a device: maximum speed, no NaNs.
+
+    Returns ``(autocast_device_type, autocast_enabled, grad_scaler_enabled)``:
+
+    * **CUDA** — classic fp16 autocast + GradScaler.
+    * **MPS (Apple Silicon)** — bfloat16 autocast, which is the big free
+      speedup on Mac GPUs. bfloat16 has fp32's exponent range so no GradScaler
+      is needed (and none is provided for MPS).
+    * **CPU / anything else** — plain fp32; everything disabled.
+
+    Callers should always use all three values together so an unsupported
+    build degrades to fp32 instead of mixing a scaler with a disabled autocast.
+    """
+    if not enabled:
+        return "cpu", False, False
+    if device_type == "cuda":
+        return "cuda", True, True
+    if device_type == "mps" and _mps_autocast_supported():
+        return "mps", True, False
+    return "cpu", False, False
 
 
 def apply_torch_runtime(plan: ResourcePlan) -> None:
@@ -361,7 +407,11 @@ def suggest_batch_size(
 
     bytes_per_sample = image_size * image_size * base_channels * 4 * 26
     bytes_per_sample += image_size * image_size * channels * 4 * 4
-    usable = memory_budget_gb * 0.60 * _BYTES_PER_GB
+    # 0.70 of the (cache-free) budget: the per-sample constant above already
+    # folds in the autograd graph, so the extra headroom buys a larger batch —
+    # more throughput per epoch — while the 26x fit factor still covers the
+    # decoder's skip-connection activations in practice.
+    usable = memory_budget_gb * 0.70 * _BYTES_PER_GB
     estimate = int(usable // max(bytes_per_sample, 1))
 
     # DataParallel takes a global batch, distributed across the visible GPUs.

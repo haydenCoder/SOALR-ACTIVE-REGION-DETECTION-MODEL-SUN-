@@ -287,6 +287,47 @@ Notes:
 - The dataset builder streams frame pairs and tiles them, so it is more disk-friendly than downloading a huge archive first.
 
 
+## Multi-day unattended run (one command)
+
+Leave it running overnight or for several days — it auto-downloads more data,
+trains, evaluates, and repeats forever, resuming exactly where it stopped:
+
+```bash
+bash scripts/run_forever.sh                       # start (Mac: auto no-sleep)
+nohup bash scripts/run_forever.sh > /dev/null 2>&1 &   # or fully detached
+tail -f ~/solar_results/arpil/run_forever.log     # follow the full log
+cat   ~/solar_results/arpil/STATUS.md             # latest state at a glance
+bash scripts/run_forever.sh --once                # single cycle, then exit (test)
+kill "$(cat ~/solar_results/arpil/run_forever.lock)"  # stop cleanly
+```
+
+What makes it safe to walk away:
+
+- **The machine will not sleep/turn off** — on macOS the script re-launches
+  itself under `caffeinate -is` automatically (keep it on AC power); on
+  systemd Linux it inhibits idle sleep.
+- **Full, timestamped logging** of *everything* to
+  `~/solar_results/arpil/run_forever.log`: a session banner (machine, GPU,
+  config), **pre-flight checks of every data-source URL** (mask index date
+  range, mask archive size, and a live probe that core frames actually exist
+  in S3 for the chosen split), a resource watchdog line every 5 minutes
+  (CPU load / RAM / disk), per-step timing with full subprocess output, and a
+  per-cycle metric summary (val Dice/IoU + object F1).
+- **Auto-run / auto-resume** — every download is resumable (per-frame
+  fragments, never redownloaded), a lock file prevents double-launches,
+  transient failures (network blips, OOMs) just retry on the next cycle, and
+  Ctrl-C / `kill` shuts down cleanly with all completed work kept.
+- **Maximum power with a cooling headroom** — every core minus 4 (macOS, so a
+  multi-day run doesn't overheat the machine) or 2 (Linux), all RAM; Apple
+  Silicon uses the MPS GPU with bfloat16 automatically. Override with
+  `CPU_HEADROOM=N` (e.g. `CPU_HEADROOM=6` for an even cooler, slower run).
+
+Useful overrides (env vars before the command):
+
+```bash
+MASK_SPLIT=validation EPOCHS=40 FRAMES_PER_CYCLE=100 bash scripts/run_forever.sh
+```
+
 ## Hardware utilisation (up to 15 GB RAM / 4 CPUs)
 
 Training claims as much of the machine as the budget allows, and **clamps to
@@ -300,11 +341,18 @@ python train.py --manifest data/processed/uad/manifest.csv \
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--cpu-budget` | `4` | Target cores. Sets torch intra-/inter-op threads, BLAS thread env vars and DataLoader workers. |
-| `--memory-budget-gb` | `15` | Target RAM. Sizes the in-RAM sample cache and `--auto-batch-size`. |
+| `--cpu-budget` | `0` (auto) | Target cores, clamped to the cores actually available. Auto = every detected core minus `--cpu-headroom`. Sets torch intra-/inter-op threads, BLAS thread env vars and DataLoader workers. |
+| `--cpu-headroom` | `2` | Cores left free for the OS when the budget is auto — maximum power while the machine stays usable (e.g. a Mac you keep working on). `0` grabs every core on a dedicated box. |
+| `--memory-budget-gb` | `0` (auto) | Target RAM. Auto = all detected RAM. Sizes the in-RAM sample cache and `--auto-batch-size`. |
 | `--cache-fraction` | `0.45` | Share of the budget spent caching decoded samples. |
-| `--auto-batch-size` | off | Picks the largest batch size that fits the memory budget. |
+| `--auto-batch-size` | on | Picks the largest batch size that fits the memory budget. |
 | `--no-channels-last` | on | Disables the channels-last memory format. |
+
+**Accelerator & mixed precision:** the device is `cuda` when available, else
+Apple Metal (`mps`) on Apple Silicon, else CPU. Training and both evaluators
+automatically use fp16 autocast + GradScaler on CUDA and bfloat16 autocast on
+MPS (no scaler needed) — on a Mac this is a free 2-5× speedup over CPU, and
+the `--cpu-headroom 2` default keeps the machine responsive while it runs.
 
 How the budget is spent:
 

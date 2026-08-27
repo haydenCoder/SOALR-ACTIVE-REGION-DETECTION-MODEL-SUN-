@@ -20,6 +20,7 @@ from solar_ar.models import AttentionUNet
 from solar_ar.runtime import (
     DEFAULT_CPU_HEADROOM,
     DEFAULT_MEMORY_HEADROOM_GB,
+    amp_settings,
     configure_runtime,
     describe_accelerator,
     preferred_device,
@@ -305,7 +306,12 @@ class Trainer:
         self.last_checkpoint_path = self.output_dir / "last.pt"
         self.channels = channels
         self.epochs = epochs
-        self.amp_enabled = amp and self.device.type == "cuda"
+        # Mixed precision for whichever accelerator won: fp16 + GradScaler on
+        # CUDA, bfloat16 autocast on Apple Silicon (MPS) — the speed win on a
+        # Mac — plain fp32 on CPU.
+        self.autocast_device_type, self.amp_enabled, self.scaler_enabled = amp_settings(
+            self.device.type, enabled=amp
+        )
         self.patience = patience
         self.loss_name = loss_name
         self.grad_accumulation_steps = max(1, grad_accumulation_steps)
@@ -416,7 +422,7 @@ class Trainer:
             learning_rate=learning_rate,
             warmup_epochs=warmup_epochs,
         )
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.scaler_enabled)
         self.criterion = build_loss(loss_name, deep_supervision=deep_supervision)
         self.best_score = -math.inf
         self.epochs_without_improvement = 0
@@ -428,6 +434,11 @@ class Trainer:
         payload = {
             "resource_plan": self.resource_plan.__dict__,
             "device": str(self.device),
+            "amp": {
+                "device_type": self.autocast_device_type,
+                "enabled": self.amp_enabled,
+                "grad_scaler": self.scaler_enabled,
+            },
             "amp_enabled": self.amp_enabled,
             "deep_supervision": self.deep_supervision,
             "ema": self.ema is not None,
@@ -535,16 +546,14 @@ class Trainer:
                     self.model,
                     images,
                     transforms=self.tta,
-                    autocast_kwargs={"device_type": "cuda", "enabled": self.amp_enabled}
-                    if self.device.type == "cuda"
-                    else {"device_type": "cpu", "enabled": False},
+                    autocast_kwargs={"device_type": self.autocast_device_type, "enabled": self.amp_enabled},
                 )
                 loss = F.binary_cross_entropy(probs.clamp(1e-6, 1 - 1e-6), masks)
                 dice, iou = compute_metrics_from_probs(probs, masks)
                 total_dice += dice
                 total_iou += iou
             else:
-                with torch.amp.autocast(device_type="cuda", enabled=self.amp_enabled):
+                with torch.amp.autocast(device_type=self.autocast_device_type, enabled=self.amp_enabled):
                     logits = self.model(images)
                     loss = self.criterion(logits, masks)
 

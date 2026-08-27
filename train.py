@@ -113,7 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CPU_HEADROOM,
         help=(
             "Cores to leave free for the OS when --cpu-budget is auto (<=0). "
-            f"Default: {DEFAULT_CPU_HEADROOM} (0 = use every detected core)."
+            f"Default: {DEFAULT_CPU_HEADROOM} (grab maximum power while the machine "
+            "stays usable; 0 = use every detected core on a dedicated box)."
         ),
     )
     hardware.add_argument(

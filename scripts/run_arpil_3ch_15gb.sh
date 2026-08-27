@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # 15 GB RAM / 4 CPU preset for solar active region segmentation.
+# The box is dedicated to training, so all 4 cores are used (an explicit
+# --torch-num-threads bypasses the 2-core OS headroom that the auto mode keeps).
 # Physically meaningful 3-channel stack:
 #   - AIA 171 Å : cooler coronal loops / quiet active-region plasma
 #   - AIA 193 Å : hotter coronal emission and active coronal structure
@@ -63,7 +65,7 @@ python3 train.py \
   --weight-decay 1e-4 \
   --num-workers 0 \
   --torch-num-threads 4 \
-  --torch-num-interop-threads 1 \
+  --torch-num-interop-threads 2 \
   --output-dir "${RUN_DIR}" \
   --base-channels "${BASE_CHANNELS}" \
   --dropout 0.05 \
