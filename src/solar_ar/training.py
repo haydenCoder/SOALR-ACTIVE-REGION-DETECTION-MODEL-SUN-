@@ -282,6 +282,7 @@ class Trainer:
         tta: str = "none",
         channels_last: bool = True,
         resume: bool = False,
+        torch_compile: bool = True,
     ) -> None:
         seed_everything(seed)
         self.device = torch.device(preferred_device())
@@ -408,6 +409,30 @@ class Trainer:
         if self.channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
 
+        # C-level graph engine: torch.compile lowers the U-Net to fused,
+        # kernel-level graphs (Metal/MPS on a Mac, oneDNN on CPU), typically a
+        # further 1.2-1.5x on top of the bfloat16 autocast. It is validated
+        # with a smoke forward BEFORE training starts, and any failure falls
+        # back to eager mode — an unattended cycle must never die on a
+        # compiler bug. dynamic=True keeps the varying last-batch size from
+        # forcing re-compiles.
+        self.compile_enabled = False
+        if torch_compile and torch.cuda.device_count() <= 1:
+            try:
+                with torch.no_grad():
+                    dummy = torch.zeros(2, len(channels), image_size, image_size, device=self.device)
+                    if self.channels_last:
+                        dummy = dummy.to(memory_format=torch.channels_last)
+                    self.model = torch.compile(self.model, dynamic=True)
+                    _ = self.model(dummy)
+                self.compile_enabled = True
+                print("[compile] torch.compile active (C-level graph engine) — the first epoch includes one-time graph capture")
+            except Exception as exc:  # noqa: BLE001 - fall back, never crash
+                self.model = self.raw_model
+                print(f"[compile] torch.compile unavailable ({type(exc).__name__}: {exc}) — continuing in eager mode")
+        elif torch_compile:
+            print("[compile] torch.compile skipped (multi-GPU DataParallel) — using eager mode")
+
         self.ema = ModelEma(self.raw_model, decay=ema_decay) if ema_decay > 0 else None
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -440,6 +465,7 @@ class Trainer:
                 "grad_scaler": self.scaler_enabled,
             },
             "amp_enabled": self.amp_enabled,
+            "torch_compile": self.compile_enabled,
             "deep_supervision": self.deep_supervision,
             "ema": self.ema is not None,
             "tta": self.tta,

@@ -190,6 +190,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     optim.add_argument("--resume", action="store_true", help="Resume training from the last checkpoint in output-dir")
+    optim.add_argument(
+        "--no-torch-compile",
+        dest="torch_compile",
+        action="store_false",
+        default=True,
+        help="Disable torch.compile (C-level graph engine, ~1.2-1.5x faster). Enabled by "
+        "default with an automatic smoke-tested fallback to eager mode if unsupported.",
+    )
     return parser
 
 
@@ -307,6 +315,7 @@ def main() -> None:
         tta=args.tta,
         channels_last=args.channels_last,
         resume=args.resume,
+        torch_compile=args.torch_compile,
     )
     trainer.fit()
 

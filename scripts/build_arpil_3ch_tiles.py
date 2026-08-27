@@ -14,6 +14,7 @@ import boto3
 import h5py
 import numpy as np
 import requests
+from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.client import Config
 from netCDF4 import Dataset as NetCDFDataset
@@ -111,8 +112,19 @@ def extract_mask(archive_path: Path, members: dict[str, str], mask_rel_path: str
             shutil.copyfileobj(source, handle)
 
 
+# Multipart download tuning: each ~570 MB frame is pulled as 16 concurrent
+# 16 MB range-requests instead of one slow stream, so a single file already
+# saturates the link; the thread pool on top of that pulls several files at
+# once. (boto3's download_file defaults to 10 x 8 MB.)
+S3_TRANSFER = TransferConfig(
+    max_concurrency=16,
+    multipart_chunksize=16 * 1024 * 1024,
+    use_threads=True,
+)
+
+
 def download_core_s3(s3_client, key: str, destination: Path) -> None:
-    s3_client.download_file(CORE_BUCKET, key, str(destination))
+    s3_client.download_file(CORE_BUCKET, key, str(destination), Config=S3_TRANSFER)
 
 
 def load_core_channels(nc_path: Path, channels: list[str]) -> np.ndarray:

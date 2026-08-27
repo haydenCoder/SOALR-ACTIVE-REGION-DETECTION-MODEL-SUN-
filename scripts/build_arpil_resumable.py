@@ -67,12 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--download-workers",
         type=int,
-        default=8,
+        default=16,
         help=(
-            "Parallel S3 downloaders (default: 8). Each in-flight frame holds a ~570 MB "
-            "temp file, so 8 workers means ~5 GB in flight and usually saturates a home "
-            "link 2-4x faster than a single stream. Do not go near 100: that is ~57 GB "
-            "in flight at once, heavy RAM/disk churn, and S3 will throttle you."
+            "Parallel S3 downloaders (default: 16). Each in-flight frame holds a ~570 MB "
+            "temp file, so 16 workers means ~9.6 GB in flight and is the max-speed default "
+            "(each file is ALSO pulled as 16 concurrent 16 MB parts). Raise on very fast "
+            "fiber (DOWNLOAD_WORKERS=32); do not go near 100 — that is ~57 GB in flight at "
+            "once, heavy RAM/disk churn, and S3 will throttle you."
         ),
     )
     parser.add_argument(

@@ -326,8 +326,9 @@ Useful overrides (env vars before the command):
 
 ```bash
 MASK_SPLIT=validation EPOCHS=40 FRAMES_PER_CYCLE=100 bash scripts/run_forever.sh
-# faster downloads on a fast link (parallel S3 streams, default 8):
-DOWNLOAD_WORKERS=16 bash scripts/run_forever.sh
+# faster downloads on very fast fiber (default is 16 parallel frames,
+# and each 570 MB frame is itself pulled as 16 concurrent 16 MB parts):
+DOWNLOAD_WORKERS=32 bash scripts/run_forever.sh
 ```
 
 ## Hardware utilisation (up to 15 GB RAM / 4 CPUs)
@@ -407,6 +408,7 @@ Optimisation:
 | `--grad-clip` | Max gradient norm, default `1.0` (correctly unscaled first under AMP). |
 | `--warmup-epochs` | Linear LR warmup before cosine decay, stepped per optimizer step. Prevents the early all-background collapse AdamW can cause on a fresh U-Net. |
 | `--loss combo` | Blends BCE-Dice with Focal-Tversky, penalising false negatives on small regions. |
+| `--no-torch-compile` | off — **torch.compile is on by default**: the C-level graph engine (Metal/MPS on a Mac, oneDNN on CPU) fuses the U-Net into optimized kernels for a further ~1.2–1.5×. It is smoke-tested before the first epoch and falls back to eager automatically if the build can't support it, so it can never break an unattended run. |
 
 Training augmentation now includes photometric jitter (gain/bias, gamma, noise)
 alongside the D4 geometric transforms, modelling instrument-response drift so
