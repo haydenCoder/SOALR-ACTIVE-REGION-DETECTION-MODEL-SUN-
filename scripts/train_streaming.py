@@ -58,6 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dropout", type=float, default=0.05)
     p.add_argument("--lr", type=float, default=3e-4, help="Base LR (constant after warmup — tuned for long incremental runs)")
     p.add_argument("--warmup-epochs", type=int, default=10)
+    p.add_argument(
+        "--rewarm-epochs", type=int, default=10,
+        help="When resuming a checkpoint that recorded its LR, ramp from that LR "
+             "up to --lr over this many epochs instead of jumping straight to the "
+             "base LR (a jump several-fold above a converged model's final LR can "
+             "destroy the weights within a few epochs).",
+    )
     p.add_argument("--batch-size", type=int, default=0, help="0 = auto from the memory budget")
     p.add_argument("--val-every", type=int, default=2, help="Validate (and update best.pt) every N epochs")
     p.add_argument("--max-epochs", type=int, default=0, help="0 = train forever until stopped")
@@ -81,13 +88,15 @@ def build_criterion(name: str):
     return BCEDiceLoss()
 
 
-def load_last(path: Path, model, optimizer, ema, device) -> tuple[int, float]:
+def load_last(path: Path, model, optimizer, ema, device) -> tuple[int, float, float | None]:
     """Resume from a checkpoint, tolerating every format this repo has produced.
 
     New streaming checkpoints store top-level ``epoch``/``best_dice``; the
     classic Trainer checkpoints (e.g. a 50-epoch best.pt from an earlier run)
     store them under ``metrics.epoch``/``best_score``/``metrics.val_dice`` and
-    may have no EMA state at all. All of them load here.
+    may have no EMA state at all. All of them load here. Also returns the LR
+    the checkpoint was trained with (when recorded) so the caller can re-warm
+    gently instead of shocking a converged model with the full base LR.
     """
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -101,7 +110,10 @@ def load_last(path: Path, model, optimizer, ema, device) -> tuple[int, float]:
     best_dice = checkpoint.get("best_dice")
     if best_dice is None:
         best_dice = checkpoint.get("best_score", checkpoint.get("metrics", {}).get("val_dice", -1e9))
-    return int(epoch), float(best_dice)
+    lr = checkpoint.get("learning_rate")
+    if lr is None:
+        lr = checkpoint.get("metrics", {}).get("learning_rate")
+    return int(epoch), float(best_dice), (float(lr) if lr else None)
 
 
 def save_checkpoint(path: Path, model, optimizer, ema, epoch: int, best_dice: float, channels: list[str]) -> None:
@@ -188,12 +200,19 @@ def main() -> None:
 
     epoch = 0
     best_dice = -1e9
+    resume_lr: float | None = None
     if args.resume and last_path.exists():
         try:
-            epoch, best_dice = load_last(last_path, model, optimizer, ema, device)
+            epoch, best_dice, resume_lr = load_last(last_path, model, optimizer, ema, device)
             print(f"[stream] resumed from {last_path} at epoch {epoch} (best_dice={best_dice:.4f})", flush=True)
+            if resume_lr is not None:
+                print(
+                    f"[stream] LR re-warm: ramping {resume_lr:.2e} (checkpoint's LR) -> {args.lr:.2e} "
+                    f"over {args.rewarm_epochs} epochs — protects a converged model from an LR shock",
+                    flush=True,
+                )
         except Exception as exc:  # noqa: BLE001 - e.g. architecture mismatch
-            epoch, best_dice = 0, -1e9
+            epoch, best_dice, resume_lr = 0, -1e9, None
             print(
                 f"[stream] WARNING: could not resume from {last_path} "
                 f"({type(exc).__name__}: {exc}) — starting fresh. "
@@ -202,6 +221,7 @@ def main() -> None:
                 f"{last_path} to silence this warning.",
                 flush=True,
             )
+    start_epoch = epoch
 
     stop = {"flag": False}
 
@@ -261,7 +281,14 @@ def main() -> None:
 
         # ---- one epoch of continuous training
         epoch += 1
-        lr = args.lr * (epoch / max(1, args.warmup_epochs)) if epoch <= args.warmup_epochs else args.lr
+        if resume_lr is not None and (epoch - start_epoch) <= args.rewarm_epochs:
+            # Re-warm from the checkpoint's own LR (safe for converged models).
+            t = (epoch - start_epoch) / max(1, args.rewarm_epochs)
+            lr = resume_lr + (args.lr - resume_lr) * t
+        elif epoch <= args.warmup_epochs:
+            lr = args.lr * (epoch / max(1, args.warmup_epochs))
+        else:
+            lr = args.lr
         for group in optimizer.param_groups:
             group["lr"] = lr
 

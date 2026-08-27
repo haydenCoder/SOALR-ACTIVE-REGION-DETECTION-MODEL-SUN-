@@ -259,7 +259,7 @@ def main() -> None:
 
     def process_frame(index: int, row: dict[str, str], temporary_dir: Path) -> None:
         """Download, mask-extract and tile ONE frame. Safe to run in a thread."""
-        nonlocal successes
+        nonlocal empty_counter, successes
         timestamp = frame_id(row)
         core_key = core_key_from_mask_path(row["file_path"])
         nc_path = temporary_dir / f"{timestamp}.nc"

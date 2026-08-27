@@ -186,21 +186,37 @@ completed_frames() {
 
 # Compact machine stats for the watchdog line. Cross-platform (Linux / macOS).
 sys_stats() {
+    # Best-effort; must NEVER crash (older/newer macOS changed vm_stat's
+    # format over the years) — worst case it prints "?".
     "$PY" - <<'PY' 2>/dev/null || echo "stats-unavailable"
 import os, re, subprocess
-ps = os.sysconf("SC_PAGE_SIZE")
-total = os.sysconf("SC_PHYS_PAGES") * ps / 2**30
+total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
+try:
+    load = open("/proc/loadavg").read().split()[0]
+except Exception:
+    try:
+        load = subprocess.check_output(["sysctl", "-n", "vm.loadavg"]).decode().lstrip("[]").split()[0]
+    except Exception:
+        load = "?"
+used = None
 try:
     mi = dict(l.split(":", 1) for l in open("/proc/meminfo") if ":" in l)
     used = total - int(mi["MemAvailable"].strip().split()[0]) / 2**20
-    load = open("/proc/loadavg").read().split()[0]
-except (OSError, ValueError, IndexError):
-    v = subprocess.check_output(["vm_stat"]).decode()
-    page = int(re.search(r"page size of (\d+)", v).group(1))
-    n = lambda p: int(re.search(p + r":\s*(\d+)", v).group(1))
-    used = (n("Pages active") + n("Pages wired count") + n("Pages occupied by compressor")) * page / 2**30
-    load = subprocess.check_output(["sysctl", "-n", "vm.loadavg"]).decode().lstrip("[] ").split()[0]
-print(f"load={load} ram={used:.1f}/{total:.1f}GB")
+except Exception:
+    try:
+        v = subprocess.check_output(["vm_stat"]).decode()
+        m = re.search(r"page size of (\d+)", v) or re.search(r"page size[:\s]+(\d+)", v)
+        if m:
+            page = int(m.group(1))
+            def pages(pat):
+                mm = re.search(pat + r":\s*(\d+)", v)
+                return int(mm.group(1)) if mm else 0
+            used = (pages(r"Pages active") + pages(r"Pages wired count")
+                    + pages(r"Pages occupied by compressor") + pages(r"Compressed")) * page / 2**30
+    except Exception:
+        pass
+ram = f"{used:.1f}/{total:.1f}GB" if used is not None else f"?/{total:.1f}GB"
+print(f"load={load} ram={ram}")
 PY
 }
 
