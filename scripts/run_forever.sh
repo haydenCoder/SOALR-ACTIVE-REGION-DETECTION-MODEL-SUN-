@@ -53,7 +53,13 @@ TEST_DIR="$HOME/solar_data/arpil_test"     # OFFICIAL test-split tiles (optional
 
 CHANNELS="aia171"          # wavelength(s) to train on (ARPIL manifest column name)
 MASK_SPLIT="${MASK_SPLIT:-train}"  # ARPIL split to mine: train|validation|test|leaky_validation
-EPOCHS=30                  # epochs to train each cycle
+# Two-phase training, tuned for short deadlines (e.g. a 3-day window):
+#   - while data is still being collected: FAST passes (EPOCHS), so each cycle
+#     ends quickly and the next batch of frames starts downloading sooner
+#   - once MAX_TOTAL_FRAMES is reached: DEEP passes (EPOCHS_FINAL) on the
+#     complete dataset — this is where the final model quality comes from
+EPOCHS=15                  # fast passes during the collection phase
+EPOCHS_FINAL=60            # deep passes once the download cap is reached
 FRAMES_PER_CYCLE=200       # NEW frames to add each cycle (may be auto-reduced)
 MAX_TOTAL_FRAMES=2000      # stop downloading beyond this (0 = no cap)
 MAX_CYCLES=100000          # effectively "forever"
@@ -584,13 +590,22 @@ while [[ $CYCLE -le $MAX_CYCLES ]]; do
     # 2) Train (fresh run each cycle on the growing dataset — robust and simple).
     #    Maximum power: every core minus the cooling headroom and all RAM; on
     #    a Mac train.py picks the Apple Metal (MPS) GPU automatically.
+    #    Two-phase: fast passes while collecting, deep passes once complete.
     OUT="$RESULTS_DIR/cycle_$CYCLE"
-    run "train (cycle $CYCLE, $EPOCHS epochs, $FRAMES frames of data)" \
+    if [[ $MAX_TOTAL_FRAMES -gt 0 && $FRAMES -ge $MAX_TOTAL_FRAMES ]]; then
+        CYCLE_EPOCHS=$EPOCHS_FINAL
+        PHASE="FINAL (dataset complete — deep $EPOCHS_FINAL-epoch training on all $FRAMES frames)"
+    else
+        CYCLE_EPOCHS=$EPOCHS
+        PHASE="collection (fast $EPOCHS-epoch pass; more frames next cycle)"
+    fi
+    log "Training phase: $PHASE"
+    run "train (cycle $CYCLE, $CYCLE_EPOCHS epochs, $FRAMES frames of data)" \
         "$PY" "$REPO_DIR/train.py" \
         --manifest "$DATA_DIR/manifest.csv" \
         --channels "$CHANNELS" \
         --image-size "$PATCH_SIZE" \
-        --epochs "$EPOCHS" --patience 0 \
+        --epochs "$CYCLE_EPOCHS" --patience 0 \
         --cpu-headroom "$CPU_HEADROOM" --memory-headroom-gb 0 \
         --output-dir "$OUT"
 
