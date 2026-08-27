@@ -8,6 +8,7 @@ import random
 import tarfile
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import boto3
@@ -124,8 +125,28 @@ S3_TRANSFER = TransferConfig(
 )
 
 
-def download_core_s3(s3_client, key: str, destination: Path) -> None:
-    s3_client.download_file(CORE_BUCKET, key, str(destination), Config=S3_TRANSFER)
+def download_core_s3(s3_client, key: str, destination: Path, attempts: int = 3) -> None:
+    """Download one core frame, retrying transient network blips quickly.
+
+    With ~200 concurrent download streams, occasional "Could not connect to
+    the endpoint URL" / reset-connection errors are normal. Retrying after a
+    short backoff costs seconds; without it a blip costs the whole frame until
+    the next cycle — hours in a long unattended run.
+    """
+    if destination.exists():
+        return
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            s3_client.download_file(CORE_BUCKET, key, str(destination), Config=S3_TRANSFER)
+            return
+        except Exception as exc:  # noqa: BLE001 - any transport failure is retryable
+            last_exc = exc
+            destination.unlink(missing_ok=True)  # drop partial multipart state
+            if attempt < attempts:
+                time.sleep(2 * attempt * attempt)
+    assert last_exc is not None
+    raise last_exc
 
 
 def load_core_channels(nc_path: Path, channels: list[str]) -> np.ndarray:
