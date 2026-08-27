@@ -10,7 +10,17 @@
 # NOT sleep or shut down while training (keep it plugged into AC power).
 # On Linux with systemd it inhibits idle sleep the same way.
 #
-# It then, in a loop (auto-resumes from exactly where it stopped):
+# CONTINUOUS mode (default, "I want results"):
+#   A background downloader pulls new frames forever (resumable, never
+#   redownloads) WHILE the streaming trainer (scripts/train_streaming.py)
+#   trains from the very FIRST frame and never restarts. Every newly
+#   downloaded frame is picked up within one epoch, and optimizer/EMA/LR state
+#   accumulates across the whole run — one model that only gets better.
+#
+# Set CONTINUOUS=0 for the classic batched loop instead:
+#   download N frames -> train on everything so far -> evaluate -> repeat.
+#
+# In both modes it:
 #   1. Detects your hardware and uses maximum power: every core minus a
 #      cooling headroom (4 cores on macOS so the machine stays cool over
 #      multi-day runs, 2 on Linux) and all RAM (Apple Silicon also uses the
@@ -18,11 +28,9 @@
 #        - patch size is chosen from RAM (512 if >=12 GB, else 256),
 #        - how much data to download is chosen from free disk.
 #   2. Downloads ARPIL tiles a little at a time (resumable, never redownloads).
-#   3. Trains an Attention U-Net on everything downloaded so far.
+#   3. Trains an Attention U-Net (continuous, or per-cycle in batched mode).
 #   4. Evaluates it (pixel Dice/IoU AND object-detection F1).
-#   5. Optionally evaluates on the OFFICIAL 2020-2024 test split.
-#   6. Cleans up junk (never your data or checkpoints).
-#   7. Logs EVERYTHING, timestamped, to ~/solar_results/arpil/run_forever.log:
+#   5. Logs EVERYTHING, timestamped, to ~/solar_results/arpil/run_forever.log:
 #        - session banner (machine, GPU, config, log location)
 #        - pre-flight checks of every data source URL (see below)
 #        - a resource watchdog line every 5 minutes (load / RAM / disk)
@@ -66,6 +74,15 @@ MAX_CYCLES=100000          # effectively "forever"
 MIN_FREE_GB=40             # refuse to download when free disk drops below this
 CYCLE_PAUSE=60             # seconds between cycles (lets the disk settle)
 WATCH_EVERY=300            # resource watchdog interval, seconds
+
+# HOW training is organised:
+#   CONTINUOUS=1 (default) — "I want results" mode: the downloader runs in the
+#     background forever while the STREAMING trainer (scripts/train_streaming.py)
+#     trains from the very FIRST frame and never restarts — optimizer state,
+#     EMA and LR accumulate across the whole run, and every newly downloaded
+#     frame is picked up within one epoch. One model that only gets better.
+#   CONTINUOUS=0 — classic batched cycles (download 200 frames -> train -> repeat).
+CONTINUOUS="${CONTINUOUS:-1}"
 
 # Official test-split evaluation (paper-comparable number). Turn on when you
 # want the 2020-2024 test metric; it builds test tiles then evaluates the
@@ -129,13 +146,19 @@ echo $$ > "$LOCK"
 
 WATCH_PID=""
 INHIBIT_PID=""
+DOWNLOADER_PID=""
 on_exit() {
     local rc=$?
     [[ -n "${SHUTDOWN_MSG:-}" ]] && log "$SHUTDOWN_MSG"
+    # Stop the background downloader (and its current python child) first.
+    if [[ -n "$DOWNLOADER_PID" ]]; then
+        pkill -P "$DOWNLOADER_PID" 2>/dev/null
+        kill "$DOWNLOADER_PID" 2>/dev/null
+    fi
     [[ -n "$WATCH_PID" ]]   && kill "$WATCH_PID" 2>/dev/null
     [[ -n "$INHIBIT_PID" ]] && kill "$INHIBIT_PID" 2>/dev/null
     rm -f "$LOCK"
-    log "Session ended (exit $rc). Re-run 'bash scripts/run_forever.sh' to resume where it stopped."
+    log "Session ended (exit $rc). Re-run 'bash scripts/run_forever.sh' to resume where it stopped (data + checkpoints kept)."
 }
 on_signal() {
     SHUTDOWN_MSG="Stop signal received — shutting down cleanly (all completed work is saved)."
@@ -517,6 +540,36 @@ start_watchdog() {
     WATCH_PID=$!
 }
 
+# Background downloader for CONTINUOUS mode: keeps pulling new frames forever
+# (each invocation resumes where the last stopped) until the frame cap or the
+# disk reserve says to pause. Every completed frame is republished to the
+# manifest, which the streaming trainer picks up automatically.
+downloader_loop() {
+    while :; do
+        FRAMES=$(completed_frames "$DATA_DIR")
+        if [[ $MAX_TOTAL_FRAMES -gt 0 && $FRAMES -ge $MAX_TOTAL_FRAMES ]]; then
+            log "Downloader: cap reached ($FRAMES frames) — all planned data collected, downloading complete."
+            break
+        fi
+        if [[ $(free_gb) -lt $MIN_FREE_GB ]]; then
+            log "Downloader: disk below the ${MIN_FREE_GB} GB reserve — pausing downloads for 10 min."
+            sleep 600
+            continue
+        fi
+        log "Downloader: batch start ($FRAMES frames on disk, adding up to $FRAMES_PER_CYCLE more)"
+        "$PY" "$REPO_DIR/scripts/build_arpil_resumable.py" \
+            --output-dir "$DATA_DIR" \
+            --split "$MASK_SPLIT" \
+            --channels "$CHANNELS" \
+            --patch-size "$PATCH_SIZE" --stride "$STRIDE" \
+            --min-mask-fraction "$MIN_MASK_FRACTION" --keep-empty-every "$KEEP_EMPTY_EVERY" \
+            --max-frames "$FRAMES_PER_CYCLE" --sampling random \
+            --download-workers "$DOWNLOAD_WORKERS" \
+            --min-free-disk-gb "$MIN_FREE_GB"
+    done
+    log "Downloader: finished."
+}
+
 # --- main ---------------------------------------------------------------------
 
 setup
@@ -524,7 +577,32 @@ detect_hardware
 session_banner
 preflight
 start_watchdog
-log "Entering the training loop (Ctrl-C to stop cleanly; re-run any time to resume)."
+
+# ===========================================================================
+# CONTINUOUS mode (default): download and train IN PARALLEL, forever.
+# Training starts from the very first frame and never restarts — the streaming
+# trainer accumulates optimizer/EMA/LR state across the whole run and picks up
+# each newly downloaded frame within one epoch. "I want results" mode.
+# ===========================================================================
+if [[ "$CONTINUOUS" == "1" ]]; then
+    log "CONTINUOUS mode: background downloader + streaming trainer (Ctrl-C stops both cleanly)."
+    downloader_loop &
+    DOWNLOADER_PID=$!
+    "$PY" "$REPO_DIR/scripts/train_streaming.py" \
+        --manifest "$DATA_DIR/manifest.csv" \
+        --channels "$CHANNELS" \
+        --image-size "$PATCH_SIZE" \
+        --output-dir "$RESULTS_DIR/continuous" \
+        --val-every 2 \
+        --status-file "$STATUS" \
+        --cpu-headroom "$CPU_HEADROOM" --memory-budget-gb 0
+    TRAINER_RC=$?
+    log "Streaming trainer exited (code $TRAINER_RC) — stopping the downloader."
+    kill "$DOWNLOADER_PID" 2>/dev/null
+    exit "$TRAINER_RC"
+fi
+
+log "Entering the batched training loop (Ctrl-C to stop cleanly; re-run any time to resume)."
 
 CYCLE=1
 while [[ $CYCLE -le $MAX_CYCLES ]]; do

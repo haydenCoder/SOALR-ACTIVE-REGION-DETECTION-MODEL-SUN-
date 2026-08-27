@@ -110,6 +110,7 @@ def write_combined_manifest(
     fieldnames: list[str],
     val_ratio: float,
     seed: int,
+    quiet: bool = False,
 ) -> None:
     frame_ids = sorted(frame for frame, rows in fragments.items() if rows)
     shuffled = frame_ids[:]
@@ -140,10 +141,11 @@ def write_combined_manifest(
         "manifest": str(manifest),
     }
     (output_dir / "progress.json").write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
-    print(f"Completed source frames: {state['completed_frames']}")
-    print(f"Tiles in combined manifest: {state['tiles']}")
-    print(f"Frame-grouped split: {state['train_frames']} train frames | {state['val_frames']} val frames")
-    print(f"Manifest written: {manifest}")
+    if not quiet:
+        print(f"Completed source frames: {state['completed_frames']}")
+        print(f"Tiles in combined manifest: {state['tiles']}")
+        print(f"Frame-grouped split: {state['train_frames']} train frames | {state['val_frames']} val frames")
+        print(f"Manifest written: {manifest}")
 
 
 def main() -> None:
@@ -273,15 +275,14 @@ def main() -> None:
 
             # Atomic per-frame commit under the lock: a future run skips this
             # frame only after its data and manifest fragment are on disk.
+            # The combined manifest is republished after EVERY frame so a
+            # streaming trainer (scripts/train_streaming.py) picks up new
+            # data within seconds, not batches.
             with manifest_lock:
                 write_fragment(fragment_dir / f"{timestamp}.csv", frame_rows, fieldnames)
                 fragments[timestamp] = frame_rows
                 successes += 1
-                # Publish progress periodically so the combined manifest and
-                # progress.json stay fresh during long batches (and a kill mid-
-                # batch leaves an accurate, already-trainable manifest).
-                if successes % 10 == 0:
-                    write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed)
+                write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed, quiet=True)
             completed_paths.append((nc_path, h5_path))
             print(f"[{index}/{len(pending)}] OK {timestamp} -> {len(frame_rows)} tiles (total {successes})", flush=True)
         except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the batch
