@@ -65,6 +65,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=8,
+        help=(
+            "Parallel S3 downloaders (default: 8). Each in-flight frame holds a ~570 MB "
+            "temp file, so 8 workers means ~5 GB in flight and usually saturates a home "
+            "link 2-4x faster than a single stream. Do not go near 100: that is ~57 GB "
+            "in flight at once, heavy RAM/disk churn, and S3 will throttle you."
+        ),
+    )
+    parser.add_argument(
         "--min-free-disk-gb", type=float, default=15.0,
         help="Stop safely before processing another frame when local free disk falls below this reserve (default: 15 GB)",
     )
@@ -194,31 +205,43 @@ def main() -> None:
         print("No new frames remain for this selection; nothing was downloaded twice.")
         return
 
+    # Headroom for the in-flight temp .nc files (each ~570 MB) so the parallel
+    # downloaders never push us below the disk reserve.
+    in_flight_reserve_gb = max(1, args.download_workers) * 0.6
+    free_gb = shutil.disk_usage(output_dir).free / (1024 ** 3)
+    if free_gb < args.min_free_disk_gb + in_flight_reserve_gb:
+        raise SystemExit(
+            f"Only {free_gb:.1f} GB is free; {args.download_workers} parallel workers need the "
+            f"{args.min_free_disk_gb:.1f} GB reserve plus ~{in_flight_reserve_gb:.0f} GB of in-flight "
+            "temp files. Free space or lower --download-workers."
+        )
+
     archive_path = output_dir / "download_cache" / "data.tar.gz"
     download_mask_archive(archive_path)
     members = index_mask_archive(archive_path)
-    s3_client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
-    empty_counter = 0
 
-    with tempfile.TemporaryDirectory(prefix="arpil_resume_") as tmp:
-        temporary_dir = Path(tmp)
-        for index, row in enumerate(pending, start=1):
-            free_gb = shutil.disk_usage(output_dir).free / (1024 ** 3)
-            if free_gb < args.min_free_disk_gb:
-                print(
-                    f"Stopping safely: {free_gb:.1f} GB free is below the "
-                    f"{args.min_free_disk_gb:.1f} GB reserve. Completed frames remain saved."
-                )
-                write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed)
-                return
-            timestamp = frame_id(row)
-            core_key = core_key_from_mask_path(row["file_path"])
-            nc_path = temporary_dir / f"{timestamp}.nc"
-            h5_path = temporary_dir / f"{timestamp}.h5"
-            print(f"[{index}/{len(pending)}] downloading core={core_key} mask={row['file_path']}")
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    manifest_lock = threading.Lock()   # guards fragments + manifest rewrites
+    empty_counter = 0                  # shared, lock-guarded (keeps Nth empty tile)
+    successes = 0
+    failures: list[tuple[str, str]] = []
+    completed_paths: list[tuple[Path, Path]] = []
+
+    def process_frame(index: int, row: dict[str, str], temporary_dir: Path) -> None:
+        """Download, mask-extract and tile ONE frame. Safe to run in a thread."""
+        nonlocal successes
+        timestamp = frame_id(row)
+        core_key = core_key_from_mask_path(row["file_path"])
+        nc_path = temporary_dir / f"{timestamp}.nc"
+        h5_path = temporary_dir / f"{timestamp}.h5"
+        # One S3 client per worker thread (boto3 clients are not thread-shared).
+        s3_client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+        print(f"[{index}/{len(pending)}] downloading core={core_key} mask={row['file_path']}", flush=True)
+        try:
             download_core_s3(s3_client, core_key, nc_path)
             extract_mask(archive_path, members, row["file_path"], h5_path)
-
             image_stack = load_core_channels(nc_path, args.channels)
             mask = load_mask(h5_path, args.mask_key)
             if image_stack.shape[1:] != mask.shape:
@@ -229,8 +252,12 @@ def main() -> None:
                 for x in iter_starts(mask.shape[1], args.patch_size, args.stride):
                     mask_patch = mask[y : y + args.patch_size, x : x + args.patch_size]
                     if float(mask_patch.mean()) < args.min_mask_fraction:
-                        empty_counter += 1
-                        if args.keep_empty_every <= 0 or empty_counter % args.keep_empty_every != 0:
+                        if args.keep_empty_every <= 0:
+                            continue
+                        with manifest_lock:
+                            empty_counter += 1
+                            keep_empty = empty_counter % args.keep_empty_every == 0
+                        if not keep_empty:
                             continue
                     sample_id = f"{timestamp}_y{y:04d}_x{x:04d}"
                     record = {"sample_id": sample_id, "split": "train"}
@@ -243,13 +270,47 @@ def main() -> None:
                     record["mask"] = os.path.relpath(mask_path, start=output_dir).replace(os.sep, "/")
                     frame_rows.append(record)
 
-            # Atomic per-frame commit: future invocations skip it only after all
-            # of its data and its manifest fragment have been written.
-            write_fragment(fragment_dir / f"{timestamp}.csv", frame_rows, fieldnames)
-            fragments[timestamp] = frame_rows
+            # Atomic per-frame commit under the lock: a future run skips this
+            # frame only after its data and manifest fragment are on disk.
+            with manifest_lock:
+                write_fragment(fragment_dir / f"{timestamp}.csv", frame_rows, fieldnames)
+                fragments[timestamp] = frame_rows
+                successes += 1
+                # Publish progress periodically so the combined manifest and
+                # progress.json stay fresh during long batches (and a kill mid-
+                # batch leaves an accurate, already-trainable manifest).
+                if successes % 10 == 0:
+                    write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed)
+            completed_paths.append((nc_path, h5_path))
+            print(f"[{index}/{len(pending)}] OK {timestamp} -> {len(frame_rows)} tiles (total {successes})", flush=True)
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the batch
+            with manifest_lock:
+                failures.append((timestamp, f"{type(exc).__name__}: {exc}"))
+            print(f"[{index}/{len(pending)}] FAILED {timestamp} -> {exc} (will retry next cycle)", flush=True)
+
+    with tempfile.TemporaryDirectory(prefix="arpil_resume_") as tmp:
+        temporary_dir = Path(tmp)
+        print(f"Downloading {len(pending)} frames with {args.download_workers} parallel workers ...")
+        with ThreadPoolExecutor(max_workers=max(1, args.download_workers)) as pool:
+            futures = [
+                pool.submit(process_frame, index, row, temporary_dir)
+                for index, row in enumerate(pending, start=1)
+            ]
+            # Block until every submitted frame has finished (success or failure).
+            for future in as_completed(futures):
+                future.result()
+
+        # Clean up temp files, then publish the combined manifest once.
+        for nc_path, h5_path in completed_paths:
             nc_path.unlink(missing_ok=True)
             h5_path.unlink(missing_ok=True)
-            write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed)
+        write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed)
+        if failures:
+            print(f"Finished: {successes} frame(s) ok, {len(failures)} failed (retried next cycle).")
+            for timestamp, reason in failures[:10]:
+                print(f"  failed {timestamp}: {reason}")
+        else:
+            print(f"Finished: {successes}/{len(pending)} frames downloaded and tiled.")
 
 
 if __name__ == "__main__":

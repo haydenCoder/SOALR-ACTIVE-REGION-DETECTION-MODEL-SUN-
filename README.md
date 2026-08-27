@@ -326,6 +326,8 @@ Useful overrides (env vars before the command):
 
 ```bash
 MASK_SPLIT=validation EPOCHS=40 FRAMES_PER_CYCLE=100 bash scripts/run_forever.sh
+# faster downloads on a fast link (parallel S3 streams, default 8):
+DOWNLOAD_WORKERS=16 bash scripts/run_forever.sh
 ```
 
 ## Hardware utilisation (up to 15 GB RAM / 4 CPUs)

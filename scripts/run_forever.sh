@@ -71,6 +71,10 @@ TEST_FRAMES=200            # how many official test frames to evaluate on
 STRIDE=512
 MIN_MASK_FRACTION=0.0005
 KEEP_EMPTY_EVERY=64
+# Parallel S3 downloaders. 8 keeps ~5 GB of temp .nc in flight and usually
+# saturates a home link 2-4x faster than one stream. Raise on fast fiber
+# (DOWNLOAD_WORKERS=16); don't go near 100 (~57 GB in flight, S3 throttles).
+DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS:-8}"
 
 # CPU headroom = cores left idle for the OS + to keep the machine cool.
 # A multi-day full-throttle run cooks a Mac, so macOS defaults to 4 cores of
@@ -555,6 +559,7 @@ while [[ $CYCLE -le $MAX_CYCLES ]]; do
                 --patch-size "$PATCH_SIZE" --stride "$STRIDE" \
                 --min-mask-fraction "$MIN_MASK_FRACTION" --keep-empty-every "$KEEP_EMPTY_EVERY" \
                 --max-frames "$FRAMES_PER_CYCLE" --sampling random \
+                --download-workers "$DOWNLOAD_WORKERS" \
                 --min-free-disk-gb "$MIN_FREE_GB"
             FRAMES=$(completed_frames "$DATA_DIR")
             log "Now have $FRAMES frames."
@@ -615,6 +620,7 @@ while [[ $CYCLE -le $MAX_CYCLES ]]; do
                 --patch-size "$PATCH_SIZE" --stride "$STRIDE" \
                 --min-mask-fraction "$MIN_MASK_FRACTION" --keep-empty-every "$KEEP_EMPTY_EVERY" \
                 --max-frames "$TEST_FRAMES" --sampling random --val-ratio 1.0 \
+                --download-workers "$DOWNLOAD_WORKERS" \
                 --min-free-disk-gb "$MIN_FREE_GB" \
                 --selection-file "$RESULTS_DIR/arpil_test_selection.json"
         fi
