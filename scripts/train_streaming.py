@@ -82,12 +82,26 @@ def build_criterion(name: str):
 
 
 def load_last(path: Path, model, optimizer, ema, device) -> tuple[int, float]:
+    """Resume from a checkpoint, tolerating every format this repo has produced.
+
+    New streaming checkpoints store top-level ``epoch``/``best_dice``; the
+    classic Trainer checkpoints (e.g. a 50-epoch best.pt from an earlier run)
+    store them under ``metrics.epoch``/``best_score``/``metrics.val_dice`` and
+    may have no EMA state at all. All of them load here.
+    """
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if ema is not None and "ema_state_dict" in checkpoint:
         ema.load_state_dict(checkpoint["ema_state_dict"], checkpoint.get("ema_updates", 0))
-    return int(checkpoint["epoch"]), float(checkpoint.get("best_dice", -1e9))
+    epoch = checkpoint.get("epoch")
+    if epoch is None:
+        epoch = checkpoint.get("metrics", {}).get("epoch", 0)
+    best_dice = checkpoint.get("best_dice")
+    if best_dice is None:
+        best_dice = checkpoint.get("best_score", checkpoint.get("metrics", {}).get("val_dice", -1e9))
+    return int(epoch), float(best_dice)
 
 
 def save_checkpoint(path: Path, model, optimizer, ema, epoch: int, best_dice: float, channels: list[str]) -> None:
@@ -175,8 +189,19 @@ def main() -> None:
     epoch = 0
     best_dice = -1e9
     if args.resume and last_path.exists():
-        epoch, best_dice = load_last(last_path, model, optimizer, ema, device)
-        print(f"[stream] resumed from {last_path} at epoch {epoch} (best_dice={best_dice:.4f})", flush=True)
+        try:
+            epoch, best_dice = load_last(last_path, model, optimizer, ema, device)
+            print(f"[stream] resumed from {last_path} at epoch {epoch} (best_dice={best_dice:.4f})", flush=True)
+        except Exception as exc:  # noqa: BLE001 - e.g. architecture mismatch
+            epoch, best_dice = 0, -1e9
+            print(
+                f"[stream] WARNING: could not resume from {last_path} "
+                f"({type(exc).__name__}: {exc}) — starting fresh. "
+                "If this was a checkpoint from a different channel set or "
+                "base-channels, it is incompatible with the current model; remove "
+                f"{last_path} to silence this warning.",
+                flush=True,
+            )
 
     stop = {"flag": False}
 
