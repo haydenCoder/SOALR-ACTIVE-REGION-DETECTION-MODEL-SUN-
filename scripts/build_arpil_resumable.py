@@ -255,7 +255,6 @@ def main() -> None:
     empty_counter = 0                  # shared, lock-guarded (keeps Nth empty tile)
     successes = 0
     failures: list[tuple[str, str]] = []
-    completed_paths: list[tuple[Path, Path]] = []
 
     def process_frame(index: int, row: dict[str, str], temporary_dir: Path) -> None:
         """Download, mask-extract and tile ONE frame. Safe to run in a thread."""
@@ -308,9 +307,16 @@ def main() -> None:
                 fragments[timestamp] = frame_rows
                 successes += 1
                 write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed, quiet=True)
-            completed_paths.append((nc_path, h5_path))
+            # Free the ~570 MB .nc and mask IMMEDIATELY. Cleaning at batch end
+            # instead would let a 200-frame batch hold ~120 GB of temp files
+            # (observed: 40+ GB of disk bleed over one batch on a real run).
+            nc_path.unlink(missing_ok=True)
+            h5_path.unlink(missing_ok=True)
             print(f"[{index}/{len(pending)}] OK {timestamp} -> {len(frame_rows)} tiles (total {successes})", flush=True)
         except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the batch
+            # Drop this frame's partial temp files even on failure.
+            nc_path.unlink(missing_ok=True)
+            h5_path.unlink(missing_ok=True)
             with manifest_lock:
                 failures.append((timestamp, f"{type(exc).__name__}: {exc}"))
             print(f"[{index}/{len(pending)}] FAILED {timestamp} -> {exc} (will retry next cycle)", flush=True)
@@ -327,10 +333,8 @@ def main() -> None:
             for future in as_completed(futures):
                 future.result()
 
-        # Clean up temp files, then publish the combined manifest once.
-        for nc_path, h5_path in completed_paths:
-            nc_path.unlink(missing_ok=True)
-            h5_path.unlink(missing_ok=True)
+        # Publish the final combined manifest (temp files were already freed
+        # per-frame as each download completed).
         write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed)
         if failures:
             print(f"Finished: {successes} frame(s) ok, {len(failures)} failed (retried next cycle).")

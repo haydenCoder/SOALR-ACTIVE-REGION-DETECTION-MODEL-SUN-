@@ -578,7 +578,7 @@ downloader_loop() {
             continue
         fi
         log "Downloader: batch start ($FRAMES frames on disk, adding up to $FRAMES_PER_CYCLE more)"
-        "$PY" "$REPO_DIR/scripts/build_arpil_resumable.py" \
+        if ! "$PY" "$REPO_DIR/scripts/build_arpil_resumable.py" \
             --output-dir "$DATA_DIR" \
             --split "$MASK_SPLIT" \
             --channels "$CHANNELS" \
@@ -586,7 +586,15 @@ downloader_loop() {
             --min-mask-fraction "$MIN_MASK_FRACTION" --keep-empty-every "$KEEP_EMPTY_EVERY" \
             --max-frames "$FRAMES_PER_CYCLE" --sampling random \
             --download-workers "$DOWNLOAD_WORKERS" \
-            --min-free-disk-gb "$MIN_FREE_GB"
+            --min-free-disk-gb "$MIN_FREE_GB"; then
+            # A crash (e.g. segfault in a native library) leaves the batch's
+            # temp .nc files orphaned — they would sit in $TMPDIR for days.
+            # Only ONE builder runs at a time (this loop is sequential), so it
+            # is safe to sweep the prefix now.
+            log "Downloader CRASHED (exit $?) — cleaning orphaned temp files, retrying with the next batch."
+            rm -rf "${TMPDIR:-/tmp}"/arpil_resume_* 2>/dev/null
+            sleep 10
+        fi
     done
     log "Downloader: finished."
 }
