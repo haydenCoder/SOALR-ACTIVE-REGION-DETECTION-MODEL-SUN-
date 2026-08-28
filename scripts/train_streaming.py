@@ -204,12 +204,18 @@ def main() -> None:
     autocast_type, amp_enabled, scaler_enabled = amp_settings(device.type)
     print(f"[stream] mixed precision: autocast={autocast_type} enabled={amp_enabled} scaler={scaler_enabled}", flush=True)
 
+    # Multi-GPU detection happens before the batch size: DataParallel trains
+    # with a GLOBAL batch that it splits across the GPUs (Kaggle T4x2), while
+    # single-GPU runs (Mac/MPS) size the batch for exactly one device.
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    use_dp = num_gpus > 1
+
     batch_size = args.batch_size or suggest_batch_size(
         args.image_size,
         len(args.channels),
         args.base_channels,
         plan.memory_budget_gb * 0.55,
-        data_parallel=False,  # this trainer runs on ONE GPU — never inflate the batch
+        data_parallel=use_dp,  # True: GLOBAL batch, DataParallel splits it across the GPUs
     )
     print(f"[stream] batch_size={batch_size} (auto)", flush=True)
 
@@ -220,6 +226,23 @@ def main() -> None:
         dropout=args.dropout,
         deep_supervision=args.deep_supervision,
     ).to(device)
+
+    # Multi-GPU (Kaggle's T4x2): nn.DataParallel splits every batch across both
+    # GPUs for the forward pass. It is a forward-only wrapper that SHARES the
+    # parameter tensors with the raw model, so the optimizer, EMA, gradient
+    # clipping, EMA-swap validation and checkpoints all keep operating on
+    # `raw_model` below — which keeps state-dict keys clean (no "module."
+    # prefix) and every checkpoint portable between this run, the Mac, and the
+    # evaluation scripts. Single-GPU runs (Mac/MPS, one-GPU machines) are
+    # completely unaffected; any DP setup failure falls back to one GPU.
+    raw_model = model
+    if use_dp:
+        try:
+            model = torch.nn.DataParallel(model)
+            print(f"[stream] using {num_gpus} GPUs with DataParallel (each batch splits across both)", flush=True)
+        except Exception as exc:  # noqa: BLE001 - DP is a speedup, never a requirement
+            use_dp = False
+            print(f"[stream] DataParallel unavailable ({type(exc).__name__}: {exc}) — continuing on one GPU", flush=True)
 
     # C-level graph engine with the same smoke-tested fallback as train.py.
     # dynamic=False: shapes are fixed per run (image size, channels, batch
@@ -234,9 +257,15 @@ def main() -> None:
     # trainer, and the first compiled epoch produced a NaN loss. Eager mode
     # with bfloat16 autocast is the proven, hang-free path on Apple Silicon
     # (CUDA keeps torch.compile — its inductor backend is mature).
+    #
+    # SKIPPED WITH DataParallel: compiled modules do not mix with the
+    # replicate/scatter/gather machinery, so two eager GPUs beat one
+    # compiled GPU here.
     compile_enabled = False
     if args.torch_compile and device.type == "mps":
         print("[compile] skipped on MPS (Apple Silicon) — inductor-MPS is unreliable in torch 2.8 (slow/hanging compiles, NaN); using eager + bfloat16 autocast", flush=True)
+    elif args.torch_compile and use_dp:
+        print("[compile] skipped — torch.compile does not mix with DataParallel; using eager on both GPUs", flush=True)
     elif args.torch_compile:
         try:
             with torch.no_grad():
@@ -251,10 +280,13 @@ def main() -> None:
                 base_channels=args.base_channels, dropout=args.dropout,
                 deep_supervision=args.deep_supervision,
             ).to(device)
+            raw_model = model  # keep the parameter-level handles on the live model
             print(f"[compile] torch.compile unavailable ({type(exc).__name__}: {exc}) — continuing in eager mode", flush=True)
 
-    ema = ModelEma(model, decay=0.999)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # EMA + optimizer on the RAW model: identical tensors in the single-GPU
+    # case, and prefix-free state-dict keys in the DataParallel case.
+    ema = ModelEma(raw_model, decay=0.999)
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
     criterion = build_criterion(args.loss, deep_supervision=args.deep_supervision)
 
@@ -268,7 +300,7 @@ def main() -> None:
     resume_lr: float | None = None
     if args.resume and last_path.exists():
         try:
-            epoch, best_dice, resume_lr = load_last(last_path, model, optimizer, ema, device)
+            epoch, best_dice, resume_lr = load_last(last_path, raw_model, optimizer, ema, device)
             print(f"[stream] resumed from {last_path} at epoch {epoch} (best_dice={best_dice:.4f})", flush=True)
             if resume_lr is not None:
                 print(
@@ -403,11 +435,11 @@ def main() -> None:
             scaler.scale(loss).backward()
             if scaler_enabled:
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            ema.update(model)
+            ema.update(raw_model)
             loss_sum += float(loss.item())
             n_batches += 1
 
@@ -422,7 +454,7 @@ def main() -> None:
             # Quick subset validation runs without TTA (4 views would cost 4x);
             # full validation keeps the configured TTA.
             val_transforms = args.tta if val_eval_n >= n_val else "none"
-            backup = ema.copy_to(model)
+            backup = ema.copy_to(raw_model)
             model.eval()
             dice_sum = iou_sum = 0.0
             vb = 0
@@ -440,7 +472,7 @@ def main() -> None:
                     dice_sum += d
                     iou_sum += i
                     vb += 1
-            model.load_state_dict(backup)
+            raw_model.load_state_dict(backup)
             val_dice = dice_sum / max(vb, 1)
             val_iou = iou_sum / max(vb, 1)
             quick_note = f" ({val_eval_n} quick)" if val_eval_n < n_val else ""
@@ -451,11 +483,11 @@ def main() -> None:
                 line += f"  (best bar calibrated to current data: {val_dice:.4f})"
             if val_dice > best_dice:
                 best_dice = val_dice
-                save_checkpoint(best_path, model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
+                save_checkpoint(best_path, raw_model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
                 line += "  ★ new best"
 
         current_lr = lr
-        save_checkpoint(last_path, model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
+        save_checkpoint(last_path, raw_model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"epoch": epoch, "loss": avg_loss, "samples": n_train}) + "\n")
         print(f"[stream] {line}", flush=True)
@@ -466,7 +498,7 @@ def main() -> None:
             print("[stream] reached --max-epochs — stopping.", flush=True)
             break
 
-    save_checkpoint(last_path, model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
+    save_checkpoint(last_path, raw_model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
     print(f"[stream] stopped at epoch {epoch}; checkpoints saved to {out_dir}", flush=True)
 
 
