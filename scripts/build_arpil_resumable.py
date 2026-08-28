@@ -89,6 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rolling-window", type=int, default=1100,
                         help="Rolling mode: maximum source frames kept on disk")
+    parser.add_argument("--rolling-max-tile-gb", type=float, default=0.0,
+                        help="Rolling mode: hard byte budget for tiles on disk (0 = off). "
+                             "Enforced after EVERY committed frame, measured in real bytes, "
+                             "so the disk stays bounded whatever the channel count / tile "
+                             "size is. This is the guarantee that keeps small persistent "
+                             "disks (Kaggle 20 GiB) from overflowing.")
     parser.add_argument("--rolling-min-lifetime-hours", type=float, default=3.0,
                         help="Rolling mode: a frame is only eligible for retirement this long "
                              "after it finished downloading — i.e. it must first be trained on "
@@ -201,24 +207,28 @@ def rotate_window(
     window: int,
     min_lifetime_hours: float,
     grace_hours: float,
+    max_tile_gb: float = 0.0,
 ) -> None:
-    """One rolling-window rotation, called at the end of each download batch.
+    """One rolling-window rotation.
 
-    Keeps at most ``window`` source frames on disk. Retiring a frame moves its
-    per-frame record to ``frame_manifests_retired/`` (a permanent name record —
-    it is never re-downloaded) and rewrites the combined manifest without it.
+    Call after EVERY committed frame (not just at batch end) so the on-disk
+    tile set is bounded at all times. A frame is retired when the window is
+    over in EITHER of two measured senses:
+    - frame count > ``window``, or
+    - tiles on disk > ``max_tile_gb`` (hard byte budget, measured from the
+      real files, 0 = disabled).
 
-    Two safety rules, in the spirit of "use each frame a few times, never
+    Retirement rules, in the spirit of "use each frame a few times, never
     error":
-    - a frame is retirement-eligible only after ``min_lifetime_hours`` (so it
-      first gets several training passes),
-    - a retired frame's tiles stay on disk for ``grace_hours`` (0 = free
-      immediately); an epoch that started just before a rotation and still
-      references a freed tile gets a neutral background sample from the data
-      loader instead of a crash.
-
-    Frames in the current validation set are never retired — they are the
-    scoreboard ``best.pt`` is selected against.
+    - a frame is eligible only after ``min_lifetime_hours`` (several training
+      passes first) — EXCEPT when a budget is over, in which case the disk
+      wins and the oldest frame retires regardless of age (a young frame
+      otherwise lets the pile-up phase overflow small disks),
+    - retired frames' records move to ``frame_manifests_retired/`` (permanent
+      name record — never re-downloaded) and their tiles are freed after
+      ``grace_hours`` (0 = immediately); an epoch still referencing a freed
+      tile gets a neutral background sample from the data loader,
+    - frames in the current validation set are never retired (scoreboard).
     """
     fragment_dir = output_dir / "frame_manifests"
     retired_dir = output_dir / "frame_manifests_retired"
@@ -233,23 +243,48 @@ def rotate_window(
                 if row.get("split") == "val":
                     val_frames.add(row["sample_id"].rsplit("_y", 1)[0])
 
-    # Retire the oldest ELIGIBLE non-val frames until at most ``window`` remain.
+    def _frame_bytes(fp: Path) -> int:
+        total = 0
+        with fp.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                for key, value in row.items():
+                    if key == "mask" or key.startswith("image_"):
+                        try:
+                            total += (output_dir / value).stat().st_size
+                        except FileNotFoundError:
+                            pass
+        return total
+
     now = time.time()
     live = sorted(fragment_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime)
-    excess = len(live) - window
+    tile_bytes = sum(_frame_bytes(p) for p in live)
+    budget_bytes = max_tile_gb * (1024 ** 3) if max_tile_gb > 0 else 0
+
     retired_now = 0
-    for path in live:
-        if excess <= 0:
+    while True:
+        over_bytes = budget_bytes > 0 and tile_bytes > budget_bytes
+        over_count = len(live) > window
+        if not (over_bytes or over_count):
             break
-        if path.stem in val_frames:
-            continue
-        age_hours = (now - path.stat().st_mtime) / 3600.0
-        if age_hours < min_lifetime_hours:
-            continue  # still being trained on — use it a few more passes first
-        new_path = retired_dir / path.name
-        path.rename(new_path)
+        victim = None
+        for path in live:  # oldest first
+            if path.stem in val_frames:
+                continue
+            age_hours = (now - path.stat().st_mtime) / 3600.0
+            # Normally a frame must have trained for min_lifetime_hours first;
+            # a violated budget overrides that (the disk is the hard wall,
+            # the lifetime is a learning preference).
+            if age_hours >= min_lifetime_hours or over_bytes or over_count:
+                victim = path
+                break
+        if victim is None:
+            break
+        tile_bytes -= _frame_bytes(victim)
+        new_path = retired_dir / victim.name
+        victim.rename(new_path)
         new_path.touch()  # mtime = retirement time (drives the tile grace gap)
-        del fragments[path.stem]
+        del fragments[victim.stem]
+        live.remove(victim)
         retired_now += 1
 
     # Free tiles of retired frames once the grace gap has elapsed.
@@ -272,8 +307,10 @@ def rotate_window(
     if retired_now or tiles_freed:
         write_combined_manifest(output_dir, fragments, fieldnames, val_ratio, seed)
         print(
-            f"[rolling] {len(live)} -> {len(fragments)} frames on disk "
-            f"(retired {retired_now} this batch; "
+            f"[rolling] {len(live) + retired_now} -> {len(live)} frames on disk "
+            f"({tile_bytes / (1024 ** 3):.1f} GiB tiles"
+            + (f" / budget {max_tile_gb:.1f} GiB" if budget_bytes else "")
+            + f"; retired {retired_now} this pass; "
             f"{len(list(retired_dir.glob('*.csv')))} retired total; "
             f"{tiles_freed} old tiles freed)",
             flush=True,
@@ -468,6 +505,21 @@ def main() -> None:
                 fragments[timestamp] = frame_rows
                 successes += 1
                 write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed, quiet=True)
+                if args.rolling:
+                    # Enforce the disk budget IMMEDIATELY (per frame, not per
+                    # batch): a 13-channel batch alone is ~10 GiB, so waiting
+                    # for batch end would let small disks overflow.
+                    try:
+                        rotate_window(
+                            output_dir, fragments, fieldnames,
+                            val_ratio=args.val_ratio, seed=args.seed,
+                            window=args.rolling_window,
+                            min_lifetime_hours=args.rolling_min_lifetime_hours,
+                            grace_hours=args.tile_grace_hours,
+                            max_tile_gb=args.rolling_max_tile_gb,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - never fatal
+                        print(f"[rolling] rotation error (ignored — data safe): {type(exc).__name__}: {exc}", flush=True)
             # Free the ~570 MB .nc and mask IMMEDIATELY. Cleaning at batch end
             # instead would let a 200-frame batch hold ~120 GB of temp files
             # (observed: 40+ GB of disk bleed over one batch on a real run).
@@ -519,25 +571,8 @@ def main() -> None:
         else:
             print(f"Finished: {successes}/{len(pending)} frames downloaded and tiled.")
 
-    if args.rolling:
-        if successes > 0:
-            # Rotate only when NEW frames arrived: once the index is exhausted
-            # there is nothing new to make room for, so rotation stops and the
-            # model simply keeps re-training on the frames still on disk.
-            try:
-                rotate_window(
-                    output_dir, fragments, fieldnames,
-                    val_ratio=args.val_ratio, seed=args.seed,
-                    window=args.rolling_window,
-                    min_lifetime_hours=args.rolling_min_lifetime_hours,
-                    grace_hours=args.tile_grace_hours,
-                )
-            except Exception as exc:  # noqa: BLE001 - rotation is an optimization, never fatal
-                print(
-                    f"[rolling] rotation error (ignored — data and training are safe): "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
+    # (Rotation itself runs per-frame inside the commit path above, so the
+    # disk budget is bounded at all times — not just at batch boundaries.)
 
 
 if __name__ == "__main__":

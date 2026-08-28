@@ -158,9 +158,15 @@ DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS:-16}"
 # trains on a continuously rotating set of frames it has never seen.
 ROLLING="${ROLLING:-0}"
 ROLLING_WINDOW="${ROLLING_WINDOW:-1100}"   # frames kept on disk (rolling mode)
+ROLLING_MAX_TILE_GB="${ROLLING_MAX_TILE_GB:-0}"  # hard BYTE budget for tiles on disk
+                                  # (0 = off). The real guarantee for small disks:
+                                  # measured after every committed frame, in real
+                                  # bytes, whatever the channel count / tile size.
 ROLLING_MIN_LIFETIME_HOURS="${ROLLING_MIN_LIFETIME_HOURS:-3}"  # each frame must first
                                   # train for this long (several passes) before it may
                                   # be retired — "use each frame ~2x before deleting"
+                                  # (a violated disk budget overrides this: the disk
+                                  # is the hard wall, the lifetime is a preference)
 TILE_GRACE_HOURS="${TILE_GRACE_HOURS:-3}"  # 0 = free a retired frame's tiles immediately
                                   # (an epoch that still references one gets a neutral
                                   # background sample instead of an error)
@@ -648,7 +654,10 @@ downloader_loop() {
         fi
         log "Downloader: batch start ($FRAMES frames on disk, adding up to $FRAMES_PER_CYCLE more)"
         ROLLING_ARG=""
-        [[ "$ROLLING" == "1" ]] && ROLLING_ARG="--rolling --rolling-window $ROLLING_WINDOW --rolling-min-lifetime-hours $ROLLING_MIN_LIFETIME_HOURS --tile-grace-hours $TILE_GRACE_HOURS"
+        if [[ "$ROLLING" == "1" ]]; then
+            ROLLING_ARG="--rolling --rolling-window $ROLLING_WINDOW --rolling-min-lifetime-hours $ROLLING_MIN_LIFETIME_HOURS --tile-grace-hours $TILE_GRACE_HOURS"
+            [[ "$ROLLING_MAX_TILE_GB" != "0" ]] && ROLLING_ARG="$ROLLING_ARG --rolling-max-tile-gb $ROLLING_MAX_TILE_GB"
+        fi
         if ! "$PY" "$REPO_DIR/scripts/build_arpil_resumable.py" \
             --output-dir "$DATA_DIR" \
             --split "$MASK_SPLIT" \

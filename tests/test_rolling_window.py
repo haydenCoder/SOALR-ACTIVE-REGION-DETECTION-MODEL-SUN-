@@ -75,7 +75,7 @@ def test_rotation_retires_oldest_and_protects_val(rolling_env):
     assert len(val_frames) == 2
 
     builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
-                          window=6, min_lifetime_hours=0, grace_hours=0)
+                          window=6, min_lifetime_hours=0, grace_hours=0, max_tile_gb=0)
 
     retired_dir = root / "frame_manifests_retired"
     retired = {p.stem for p in retired_dir.glob("*.csv")}
@@ -101,7 +101,7 @@ def test_retired_names_are_permanent_record(rolling_env):
     """Retired frames must count as 'completed' so they are never re-downloaded."""
     root, stamps, fragments = rolling_env["root"], rolling_env["stamps"], rolling_env["fragments"]
     builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
-                          window=6, min_lifetime_hours=0, grace_hours=0)
+                          window=6, min_lifetime_hours=0, grace_hours=0, max_tile_gb=0)
     retired_dir = root / "frame_manifests_retired"
     completed = set(fragments) | set(builder.load_fragment_rows(retired_dir))
     assert completed == set(stamps)  # every frame name is recorded, live or retired
@@ -110,7 +110,7 @@ def test_retired_names_are_permanent_record(rolling_env):
 def test_grace_gap_keeps_retired_tiles_for_training(rolling_env):
     root, _, fragments = rolling_env["root"], None, rolling_env["fragments"]
     builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
-                          window=6, min_lifetime_hours=0, grace_hours=1.0)  # 1-hour gap
+                          window=6, min_lifetime_hours=0, grace_hours=1.0, max_tile_gb=0)
     retired = list((root / "frame_manifests_retired").glob("*.csv"))
     assert retired, "expected retired frames"
     for fp in retired:
@@ -118,28 +118,54 @@ def test_grace_gap_keeps_retired_tiles_for_training(rolling_env):
         assert (root / "images" / "aia171" / f"{fp.stem}_t0.npz").exists()
 
 
-def test_min_lifetime_protects_young_frames(rolling_env):
-    """A frame must first train for min_lifetime_hours before it may be retired."""
+def test_min_lifetime_protects_young_frames_when_budgets_hold(rolling_env):
+    """With no budget violated, young frames must train for min_lifetime_hours first."""
     root, stamps, fragments = rolling_env["root"], rolling_env["stamps"], rolling_env["fragments"]
-    # All fixture frames are < 1 h old; require 6 h -> nothing may be retired,
-    # even though the window is over its limit.
+    # No budget pressure (window == frame count, no byte budget); require 6 h
+    # -> nothing may be retired, all frames are < 1 h old.
     builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
-                          window=2, min_lifetime_hours=6.0, grace_hours=0)
-    assert not (root / "frame_manifests_retired").exists() or \
-        not list((root / "frame_manifests_retired").glob("*.csv"))
+                          window=10, min_lifetime_hours=6.0, grace_hours=0, max_tile_gb=0)
+    assert not list((root / "frame_manifests_retired").glob("*.csv"))
     assert len(list((root / "frame_manifests").glob("*.csv"))) == 10
-    # Age the two oldest frames past the lifetime -> now they ARE eligible.
-    frag_dir = root / "frame_manifests"
-    for i, stamp in enumerate(stamps[:2]):
-        ts = time.time() - 7 * 3600
-        os.utime(frag_dir / f"{stamp}.csv", (ts, ts))
+
+
+def test_byte_budget_forces_retirement_of_young_frames(tmp_path: Path):
+    """The hard byte budget is the real disk guarantee: it overrides the
+    minimum lifetime (the disk is the hard wall) and retires in measured bytes."""
+    root = tmp_path / "data"
+    stamps = [f"20100513_{i:04d}" for i in range(10)]
+    for i, stamp in enumerate(stamps):
+        _write_frame(root, stamp, age_seconds=(10 - i) * 60)  # all young (< 1 min)
+    fragments = builder.load_fragment_rows(root / "frame_manifests")
+    builder.write_combined_manifest(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42)
+
+    total_tiles = sum(
+        f.stat().st_size
+        for d in (root / "images", root / "masks") for f in d.rglob("*.npz")
+    )
+    assert total_tiles > 0
+    budget_gb = total_tiles / (1024 ** 3) * 0.4  # budget = 40% of current tiles
+
     builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
-                          window=8, min_lifetime_hours=6.0, grace_hours=0)
+                          window=100,  # no count pressure
+                          min_lifetime_hours=100.0,  # nobody is lifetime-eligible
+                          grace_hours=0, max_tile_gb=budget_gb)
+
     retired = {p.stem for p in (root / "frame_manifests_retired").glob("*.csv")}
-    # Only the aged frames can be retired (val frames are protected).
-    assert retired <= set(stamps[:2])
-    assert all(t not in retired for t in _expected_val_frames(
-        {s: [{}] for s in stamps}, val_ratio=0.2, seed=42))
+    assert retired, "byte budget must force retirement even for young frames"
+    # Oldest-first, val frames protected.
+    val_frames = _expected_val_frames({s: [{}] for s in stamps}, val_ratio=0.2, seed=42)
+    assert not (retired & val_frames)
+    # Measured bytes of the LIVE frames are now under the budget.
+    remaining = 0
+    live_dir = root / "frame_manifests"
+    for fp in live_dir.glob("*.csv"):
+        with fp.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                for key, value in row.items():
+                    if key == "mask" or key.startswith("image_"):
+                        remaining += (root / value).stat().st_size
+    assert remaining <= budget_gb * (1024 ** 3)
 
 
 def _build_two_frame_dataset(root: Path) -> tuple[Path, list[str]]:
