@@ -18,6 +18,7 @@ import random
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # Reuse the tested upstream-download and tile helper functions.
@@ -28,8 +29,6 @@ from build_arpil_3ch_tiles import (  # noqa: E402
     core_key_from_mask_path,
     download_core_s3,
     download_mask_archive,
-    extract_mask,
-    index_mask_archive,
     iter_starts,
     load_core_channels,
     load_mask,
@@ -172,6 +171,35 @@ def write_combined_manifest(
         print(f"Manifest written: {manifest}")
 
 
+def extract_masks_batch(archive_path: Path, needed_rel_paths: list[str], extract_dir: Path) -> dict[str, Path]:
+    """Extract every needed mask in ONE streaming pass over the gzip archive.
+
+    Gzip cannot seek, so the old per-frame extract_mask() made each of the 16
+    workers re-decompress up to the whole 1.2 GB archive for its one mask —
+    16 concurrent gzip+HDF5 streams that hammered CPU/RAM and intermittently
+    segfaulted the process on a 16 GB Mac. One pass decompresses the archive
+    exactly once (~3 s) and leaves every mask on disk for the pool to read.
+    """
+    import tarfile
+
+    needed = {Path(p).name for p in needed_rel_paths}
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    found: dict[str, Path] = {}
+    with tarfile.open(archive_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            name = Path(member.name).name
+            if name in needed and member.isfile():
+                dest = extract_dir / name
+                source = tar.extractfile(member)
+                if source is not None:
+                    with source, dest.open("wb") as out:
+                        shutil.copyfileobj(source, out)
+                found[name] = dest
+                if len(found) == len(needed):
+                    break
+    return found
+
+
 def main() -> None:
     args = build_parser().parse_args()
     raise_file_limit()
@@ -246,31 +274,40 @@ def main() -> None:
 
     archive_path = output_dir / "download_cache" / "data.tar.gz"
     download_mask_archive(archive_path)
-    members = index_mask_archive(archive_path)
 
     import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     manifest_lock = threading.Lock()   # guards fragments + manifest rewrites
+    hdf5_lock = threading.Lock()       # serializes native HDF5/netCDF reads (see below)
     empty_counter = 0                  # shared, lock-guarded (keeps Nth empty tile)
     successes = 0
     failures: list[tuple[str, str]] = []
 
-    def process_frame(index: int, row: dict[str, str], temporary_dir: Path) -> None:
-        """Download, mask-extract and tile ONE frame. Safe to run in a thread."""
+    def process_frame(index: int, row: dict[str, str], temporary_dir: Path, mask_paths: dict[str, Path]) -> None:
+        """Download and tile ONE frame. Safe to run in a thread."""
         nonlocal empty_counter, successes
         timestamp = frame_id(row)
         core_key = core_key_from_mask_path(row["file_path"])
         nc_path = temporary_dir / f"{timestamp}.nc"
-        h5_path = temporary_dir / f"{timestamp}.h5"
+        h5_path = mask_paths.get(f"{timestamp}.h5")
+        if h5_path is None or not h5_path.exists():
+            with manifest_lock:
+                failures.append((timestamp, "mask not found in archive"))
+            print(f"[{index}/{len(pending)}] FAILED {timestamp} -> mask not found in archive (upstream layout change?)", flush=True)
+            return
         # One S3 client per worker thread (boto3 clients are not thread-shared).
         s3_client = boto3.client("s3", config=Config(signature_version=UNSIGNED))
-        print(f"[{index}/{len(pending)}] downloading core={core_key} mask={row['file_path']}", flush=True)
+        print(f"[{index}/{len(pending)}] downloading core={core_key}", flush=True)
         try:
             download_core_s3(s3_client, core_key, nc_path)
-            extract_mask(archive_path, members, row["file_path"], h5_path)
-            image_stack = load_core_channels(nc_path, args.channels)
-            mask = load_mask(h5_path, args.mask_key)
+            # Serialize the native reads: the .nc (netCDF4/HDF5 C lib) and the
+            # .h5 (h5py C lib) reads run one thread at a time. Downloads stay
+            # fully parallel (pure network I/O); only the C-library calls are
+            # the intermittent segfault source on a RAM-tight Mac.
+            with hdf5_lock:
+                image_stack = load_core_channels(nc_path, args.channels)
+                mask = load_mask(h5_path, args.mask_key)
             if image_stack.shape[1:] != mask.shape:
                 raise ValueError(f"Shape mismatch for {timestamp}: image={image_stack.shape[1:]}, mask={mask.shape}")
 
@@ -323,10 +360,25 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="arpil_resume_") as tmp:
         temporary_dir = Path(tmp)
+        # ONE pass over the 1.2 GB archive extracts EVERY mask this batch
+        # needs (a few seconds). The old per-frame extraction made each of the
+        # 16 workers re-decompress up to the whole archive for its one mask —
+        # 16 concurrent gzip+HDF5 streams that hammered CPU/RAM, slowed every
+        # batch down, and intermittently segfaulted the process on a 16 GB Mac.
+        t0 = time.time()
+        mask_paths = extract_masks_batch(
+            archive_path, [row["file_path"] for row in pending], temporary_dir
+        )
+        missing = len(pending) - len(mask_paths)
+        print(
+            f"Pre-extracted {len(mask_paths)}/{len(pending)} masks in {time.time() - t0:.1f}s"
+            + ("" if missing == 0 else f" ({missing} missing from archive — those frames will be marked failed)"),
+            flush=True,
+        )
         print(f"Downloading {len(pending)} frames with {args.download_workers} parallel workers ...")
         with ThreadPoolExecutor(max_workers=max(1, args.download_workers)) as pool:
             futures = [
-                pool.submit(process_frame, index, row, temporary_dir)
+                pool.submit(process_frame, index, row, temporary_dir, mask_paths)
                 for index, row in enumerate(pending, start=1)
             ]
             # Block until every submitted frame has finished (success or failure).
