@@ -75,7 +75,7 @@ def test_rotation_retires_oldest_and_protects_val(rolling_env):
     assert len(val_frames) == 2
 
     builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
-                          window=6, grace_hours=0)
+                          window=6, min_lifetime_hours=0, grace_hours=0)
 
     retired_dir = root / "frame_manifests_retired"
     retired = {p.stem for p in retired_dir.glob("*.csv")}
@@ -101,7 +101,7 @@ def test_retired_names_are_permanent_record(rolling_env):
     """Retired frames must count as 'completed' so they are never re-downloaded."""
     root, stamps, fragments = rolling_env["root"], rolling_env["stamps"], rolling_env["fragments"]
     builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
-                          window=6, grace_hours=0)
+                          window=6, min_lifetime_hours=0, grace_hours=0)
     retired_dir = root / "frame_manifests_retired"
     completed = set(fragments) | set(builder.load_fragment_rows(retired_dir))
     assert completed == set(stamps)  # every frame name is recorded, live or retired
@@ -110,12 +110,36 @@ def test_retired_names_are_permanent_record(rolling_env):
 def test_grace_gap_keeps_retired_tiles_for_training(rolling_env):
     root, _, fragments = rolling_env["root"], None, rolling_env["fragments"]
     builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
-                          window=6, grace_hours=1.0)  # 1-hour safety gap
+                          window=6, min_lifetime_hours=0, grace_hours=1.0)  # 1-hour gap
     retired = list((root / "frame_manifests_retired").glob("*.csv"))
     assert retired, "expected retired frames"
     for fp in retired:
         # Just retired -> within the grace gap -> tiles must still be on disk.
         assert (root / "images" / "aia171" / f"{fp.stem}_t0.npz").exists()
+
+
+def test_min_lifetime_protects_young_frames(rolling_env):
+    """A frame must first train for min_lifetime_hours before it may be retired."""
+    root, stamps, fragments = rolling_env["root"], rolling_env["stamps"], rolling_env["fragments"]
+    # All fixture frames are < 1 h old; require 6 h -> nothing may be retired,
+    # even though the window is over its limit.
+    builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
+                          window=2, min_lifetime_hours=6.0, grace_hours=0)
+    assert not (root / "frame_manifests_retired").exists() or \
+        not list((root / "frame_manifests_retired").glob("*.csv"))
+    assert len(list((root / "frame_manifests").glob("*.csv"))) == 10
+    # Age the two oldest frames past the lifetime -> now they ARE eligible.
+    frag_dir = root / "frame_manifests"
+    for i, stamp in enumerate(stamps[:2]):
+        ts = time.time() - 7 * 3600
+        os.utime(frag_dir / f"{stamp}.csv", (ts, ts))
+    builder.rotate_window(root, fragments, FIELDNAMES, val_ratio=0.2, seed=42,
+                          window=8, min_lifetime_hours=6.0, grace_hours=0)
+    retired = {p.stem for p in (root / "frame_manifests_retired").glob("*.csv")}
+    # Only the aged frames can be retired (val frames are protected).
+    assert retired <= set(stamps[:2])
+    assert all(t not in retired for t in _expected_val_frames(
+        {s: [{}] for s in stamps}, val_ratio=0.2, seed=42))
 
 
 def _build_two_frame_dataset(root: Path) -> tuple[Path, list[str]]:

@@ -89,10 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rolling-window", type=int, default=1100,
                         help="Rolling mode: maximum source frames kept on disk")
+    parser.add_argument("--rolling-min-lifetime-hours", type=float, default=3.0,
+                        help="Rolling mode: a frame is only eligible for retirement this long "
+                             "after it finished downloading — i.e. it must first be trained on "
+                             "for several passes (e.g. 3 h ~ 2-4 full passes over a small window). "
+                             "Set 0 to allow retiring the oldest immediately.")
     parser.add_argument("--tile-grace-hours", type=float, default=3.0,
                         help="Rolling mode: keep a retired frame's tiles on disk this long "
-                             "before deleting (safety gap so an in-flight training epoch "
-                             "can never read a tile out from under it)")
+                             "before deleting (0 = free immediately; an in-flight epoch that "
+                             "still references a freed tile falls back to a neutral background "
+                             "sample instead of erroring)")
     return parser
 
 
@@ -193,19 +199,26 @@ def rotate_window(
     val_ratio: float,
     seed: int,
     window: int,
+    min_lifetime_hours: float,
     grace_hours: float,
 ) -> None:
     """One rolling-window rotation, called at the end of each download batch.
 
-    Keeps at most ``window`` source frames on disk. The oldest frames are
-    retired: their per-frame record moves to ``frame_manifests_retired/``
-    (a permanent name record — they are never re-downloaded), and the
-    combined manifest is rewritten without them. A retired frame's tiles
-    stay on disk for ``grace_hours`` so a training epoch that was already
-    running when the rotation happened can never read a file out from under
-    it; after the gap the tiles are deleted and the space is reused for new
-    frames. Frames in the current validation set are never retired — they
-    are the scoreboard ``best.pt`` is selected against.
+    Keeps at most ``window`` source frames on disk. Retiring a frame moves its
+    per-frame record to ``frame_manifests_retired/`` (a permanent name record —
+    it is never re-downloaded) and rewrites the combined manifest without it.
+
+    Two safety rules, in the spirit of "use each frame a few times, never
+    error":
+    - a frame is retirement-eligible only after ``min_lifetime_hours`` (so it
+      first gets several training passes),
+    - a retired frame's tiles stay on disk for ``grace_hours`` (0 = free
+      immediately); an epoch that started just before a rotation and still
+      references a freed tile gets a neutral background sample from the data
+      loader instead of a crash.
+
+    Frames in the current validation set are never retired — they are the
+    scoreboard ``best.pt`` is selected against.
     """
     fragment_dir = output_dir / "frame_manifests"
     retired_dir = output_dir / "frame_manifests_retired"
@@ -220,7 +233,8 @@ def rotate_window(
                 if row.get("split") == "val":
                     val_frames.add(row["sample_id"].rsplit("_y", 1)[0])
 
-    # Retire the oldest non-val frames until at most ``window`` remain.
+    # Retire the oldest ELIGIBLE non-val frames until at most ``window`` remain.
+    now = time.time()
     live = sorted(fragment_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime)
     excess = len(live) - window
     retired_now = 0
@@ -229,6 +243,9 @@ def rotate_window(
             break
         if path.stem in val_frames:
             continue
+        age_hours = (now - path.stat().st_mtime) / 3600.0
+        if age_hours < min_lifetime_hours:
+            continue  # still being trained on — use it a few more passes first
         new_path = retired_dir / path.name
         path.rename(new_path)
         new_path.touch()  # mtime = retirement time (drives the tile grace gap)
@@ -236,10 +253,10 @@ def rotate_window(
         retired_now += 1
 
     # Free tiles of retired frames once the grace gap has elapsed.
-    cutoff = time.time() - grace_hours * 3600.0
+    cutoff = now - grace_hours * 3600.0
     tiles_freed = 0
     for path in sorted(retired_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime):
-        if path.stat().st_mtime >= cutoff:
+        if path.stat().st_mtime > cutoff:
             continue
         with path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
@@ -360,6 +377,12 @@ def main() -> None:
     if not pending:
         write_combined_manifest(output_dir, fragments, fieldnames, args.val_ratio, args.seed)
         print("No new frames remain for this selection; nothing was downloaded twice.")
+        if args.rolling:
+            print(
+                "Rolling: the index is exhausted — rotation stops here; training simply "
+                "continues to re-practice the frames still on disk (no error, no idle).",
+                flush=True,
+            )
         return
 
     # Headroom for the in-flight temp .nc files (each ~570 MB) so the parallel
@@ -497,11 +520,24 @@ def main() -> None:
             print(f"Finished: {successes}/{len(pending)} frames downloaded and tiled.")
 
     if args.rolling:
-        rotate_window(
-            output_dir, fragments, fieldnames,
-            val_ratio=args.val_ratio, seed=args.seed,
-            window=args.rolling_window, grace_hours=args.tile_grace_hours,
-        )
+        if successes > 0:
+            # Rotate only when NEW frames arrived: once the index is exhausted
+            # there is nothing new to make room for, so rotation stops and the
+            # model simply keeps re-training on the frames still on disk.
+            try:
+                rotate_window(
+                    output_dir, fragments, fieldnames,
+                    val_ratio=args.val_ratio, seed=args.seed,
+                    window=args.rolling_window,
+                    min_lifetime_hours=args.rolling_min_lifetime_hours,
+                    grace_hours=args.tile_grace_hours,
+                )
+            except Exception as exc:  # noqa: BLE001 - rotation is an optimization, never fatal
+                print(
+                    f"[rolling] rotation error (ignored — data and training are safe): "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":

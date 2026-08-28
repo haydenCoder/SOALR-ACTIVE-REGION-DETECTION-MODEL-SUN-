@@ -158,6 +158,12 @@ DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS:-16}"
 # trains on a continuously rotating set of frames it has never seen.
 ROLLING="${ROLLING:-0}"
 ROLLING_WINDOW="${ROLLING_WINDOW:-1100}"   # frames kept on disk (rolling mode)
+ROLLING_MIN_LIFETIME_HOURS="${ROLLING_MIN_LIFETIME_HOURS:-3}"  # each frame must first
+                                  # train for this long (several passes) before it may
+                                  # be retired — "use each frame ~2x before deleting"
+TILE_GRACE_HOURS="${TILE_GRACE_HOURS:-3}"  # 0 = free a retired frame's tiles immediately
+                                  # (an epoch that still references one gets a neutral
+                                  # background sample instead of an error)
 LR="${LR:-}"                     # optional learning rate for the streaming trainer
                                   # (rolling runs use a lower LR, e.g. 1e-4, so
                                   # updates overwrite less of the old knowledge)
@@ -432,7 +438,7 @@ session_banner() {
     log "GPU      : $GPU_INFO"
     log "Data dir : $DATA_DIR"
     log "Results  : $RESULTS_DIR"
-    log "Config   : channels=$CHANNELS split=$MASK_SPLIT epochs=$EPOCHS frames/cycle=$FRAMES_PER_CYCLE max_frames=$MAX_TOTAL_FRAMES patch=$PATCH_SIZE min_free=${MIN_FREE_GB}GB cycles=${MAX_CYCLES} rolling=$ROLLING window=$ROLLING_WINDOW lr=${LR:-default}"
+    log "Config   : channels=$CHANNELS split=$MASK_SPLIT epochs=$EPOCHS frames/cycle=$FRAMES_PER_CYCLE max_frames=$MAX_TOTAL_FRAMES patch=$PATCH_SIZE min_free=${MIN_FREE_GB}GB cycles=${MAX_CYCLES} rolling=$ROLLING window=$ROLLING_WINDOW min_lifetime=${ROLLING_MIN_LIFETIME_HOURS}h grace=${TILE_GRACE_HOURS}h lr=${LR:-default}"
     log "Log      : $LOG   (watch: tail -f $LOG)"
     log "Status   : $STATUS"
     hr
@@ -642,7 +648,7 @@ downloader_loop() {
         fi
         log "Downloader: batch start ($FRAMES frames on disk, adding up to $FRAMES_PER_CYCLE more)"
         ROLLING_ARG=""
-        [[ "$ROLLING" == "1" ]] && ROLLING_ARG="--rolling --rolling-window $ROLLING_WINDOW"
+        [[ "$ROLLING" == "1" ]] && ROLLING_ARG="--rolling --rolling-window $ROLLING_WINDOW --rolling-min-lifetime-hours $ROLLING_MIN_LIFETIME_HOURS --tile-grace-hours $TILE_GRACE_HOURS"
         if ! "$PY" "$REPO_DIR/scripts/build_arpil_resumable.py" \
             --output-dir "$DATA_DIR" \
             --split "$MASK_SPLIT" \
