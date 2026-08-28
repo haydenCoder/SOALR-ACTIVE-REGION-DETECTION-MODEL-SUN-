@@ -169,7 +169,10 @@ mkdir -p "$RESULTS_DIR" "$DATA_DIR" "$TEST_DIR"
 LOG="$RESULTS_DIR/run_forever.log"
 STATUS="$RESULTS_DIR/STATUS.md"
 LOCK="$RESULTS_DIR/run_forever.lock"
-PY="$REPO_DIR/.venv/bin/python"
+PY="${SOLAR_PYTHON:-$REPO_DIR/.venv/bin/python}"   # SOLAR_PYTHON: use an existing
+                                  # interpreter (e.g. Kaggle's session Python,
+                                  # where creating a venv is broken); default
+                                  # is the repo's own .venv (Mac / other).
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { printf '[%s] %s\n' "$(ts)" "$*" | tee -a "$LOG"; }
@@ -334,7 +337,9 @@ install_deps() {
 }
 
 setup() {
-    if [[ ! -x "$PY" ]]; then
+    # Only create a venv when we're actually using the repo venv. With
+    # SOLAR_PYTHON set (Kaggle), the session interpreter is used as-is.
+    if [[ "$PY" == "$REPO_DIR/.venv/bin/python" && ! -x "$PY" ]]; then
         log "Creating Python venv at $REPO_DIR/.venv ..."
         local pybin
         pybin="$(pick_python || echo python3)"
@@ -345,7 +350,7 @@ setup() {
         fi
     fi
     if ! deps_ok; then
-        log "Python dependencies missing or broken — installing into $REPO_DIR/.venv ..."
+        log "Python dependencies missing or broken — installing into $PY ..."
         install_deps || log "(install not complete yet — each cycle retries automatically)"
     fi
     log "Python: $("$PY" --version 2>&1)"
@@ -699,7 +704,7 @@ while [[ $CYCLE -le $MAX_CYCLES ]]; do
     # download, wiped venv), fix it BEFORE spending a cycle on doomed steps.
     if [[ ! -x "$PY" ]] || ! deps_ok; then
         log "Python environment missing or broken — repairing before this cycle ..."
-        if [[ ! -x "$PY" ]]; then
+        if [[ "$PY" == "$REPO_DIR/.venv/bin/python" && ! -x "$PY" ]]; then
             pybin="$(pick_python || echo python3)"
             "$pybin" -m venv "$REPO_DIR/.venv" >>"$LOG" 2>&1
         fi
