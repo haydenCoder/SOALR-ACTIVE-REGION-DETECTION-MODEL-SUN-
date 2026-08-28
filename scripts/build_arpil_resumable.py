@@ -79,6 +79,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-free-disk-gb", type=float, default=15.0,
         help="Stop safely before processing another frame when local free disk falls below this reserve (default: 15 GB)",
     )
+    parser.add_argument(
+        "--rolling", action="store_true",
+        help="Rolling-window mode: after each batch, retire the oldest frames so the "
+             "on-disk tile set stays within --rolling-window frames. Retired frame names "
+             "are recorded permanently (frame_manifests_retired/) and never re-downloaded; "
+             "their tiles are freed after --tile-grace-hours. Use on small persistent "
+             "disks (e.g. Kaggle) to train on a continuously rotating set of NEW frames.",
+    )
+    parser.add_argument("--rolling-window", type=int, default=1100,
+                        help="Rolling mode: maximum source frames kept on disk")
+    parser.add_argument("--tile-grace-hours", type=float, default=3.0,
+                        help="Rolling mode: keep a retired frame's tiles on disk this long "
+                             "before deleting (safety gap so an in-flight training epoch "
+                             "can never read a tile out from under it)")
     return parser
 
 
@@ -171,6 +185,84 @@ def write_combined_manifest(
         print(f"Manifest written: {manifest}")
 
 
+def rotate_window(
+    output_dir: Path,
+    fragments: dict[str, list[dict[str, str]]],
+    fieldnames: list[str],
+    *,
+    val_ratio: float,
+    seed: int,
+    window: int,
+    grace_hours: float,
+) -> None:
+    """One rolling-window rotation, called at the end of each download batch.
+
+    Keeps at most ``window`` source frames on disk. The oldest frames are
+    retired: their per-frame record moves to ``frame_manifests_retired/``
+    (a permanent name record — they are never re-downloaded), and the
+    combined manifest is rewritten without them. A retired frame's tiles
+    stay on disk for ``grace_hours`` so a training epoch that was already
+    running when the rotation happened can never read a file out from under
+    it; after the gap the tiles are deleted and the space is reused for new
+    frames. Frames in the current validation set are never retired — they
+    are the scoreboard ``best.pt`` is selected against.
+    """
+    fragment_dir = output_dir / "frame_manifests"
+    retired_dir = output_dir / "frame_manifests_retired"
+    retired_dir.mkdir(exist_ok=True)
+
+    # Current validation frames (from the manifest just written) are protected.
+    val_frames: set[str] = set()
+    manifest = output_dir / "manifest.csv"
+    if manifest.exists():
+        with manifest.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if row.get("split") == "val":
+                    val_frames.add(row["sample_id"].rsplit("_y", 1)[0])
+
+    # Retire the oldest non-val frames until at most ``window`` remain.
+    live = sorted(fragment_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime)
+    excess = len(live) - window
+    retired_now = 0
+    for path in live:
+        if excess <= 0:
+            break
+        if path.stem in val_frames:
+            continue
+        new_path = retired_dir / path.name
+        path.rename(new_path)
+        new_path.touch()  # mtime = retirement time (drives the tile grace gap)
+        del fragments[path.stem]
+        retired_now += 1
+
+    # Free tiles of retired frames once the grace gap has elapsed.
+    cutoff = time.time() - grace_hours * 3600.0
+    tiles_freed = 0
+    for path in sorted(retired_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime):
+        if path.stat().st_mtime >= cutoff:
+            continue
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        for row in rows:
+            for key, value in row.items():
+                if key == "mask" or key.startswith("image_"):
+                    try:
+                        (output_dir / value).unlink()
+                        tiles_freed += 1
+                    except FileNotFoundError:
+                        pass
+
+    if retired_now or tiles_freed:
+        write_combined_manifest(output_dir, fragments, fieldnames, val_ratio, seed)
+        print(
+            f"[rolling] {len(live)} -> {len(fragments)} frames on disk "
+            f"(retired {retired_now} this batch; "
+            f"{len(list(retired_dir.glob('*.csv')))} retired total; "
+            f"{tiles_freed} old tiles freed)",
+            flush=True,
+        )
+
+
 def extract_masks_batch(archive_path: Path, needed_rel_paths: list[str], extract_dir: Path) -> dict[str, Path]:
     """Extract every needed mask in ONE streaming pass over the gzip archive.
 
@@ -219,7 +311,12 @@ def main() -> None:
 
     fieldnames = ["sample_id", "split", *(f"image_{channel}" for channel in args.channels), "mask"]
     fragments = load_fragment_rows(fragment_dir)
+    # Retired frames (rolling window) are a permanent name record: they were
+    # already trained on and must never be re-downloaded.
+    retired_dir = output_dir / "frame_manifests_retired"
     completed = set(fragments)
+    if retired_dir.exists():
+        completed |= set(load_fragment_rows(retired_dir))
 
     rows = read_csv_rows(MASK_SPLIT_URLS[args.split])
     rows = [row for row in rows if row.get("present", "0") not in {"0", "0.0", "", None} and row.get("file_path")]
@@ -398,6 +495,13 @@ def main() -> None:
                 print(f"  failed {timestamp}: {reason}")
         else:
             print(f"Finished: {successes}/{len(pending)} frames downloaded and tiled.")
+
+    if args.rolling:
+        rotate_window(
+            output_dir, fragments, fieldnames,
+            val_ratio=args.val_ratio, seed=args.seed,
+            window=args.rolling_window, grace_hours=args.tile_grace_hours,
+        )
 
 
 if __name__ == "__main__":

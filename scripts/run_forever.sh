@@ -150,6 +150,18 @@ KEEP_EMPTY_EVERY=64
 # (DOWNLOAD_WORKERS=32); don't go near 100 (~57 GB in flight, S3 throttles).
 DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS:-16}"
 
+# ROLLING mode (for small persistent disks, e.g. Kaggle's 20 GiB): instead of
+# stopping at MAX_TOTAL_FRAMES, keep downloading NEW frames forever and rotate
+# the on-disk tile window — after each batch the oldest frames are retired
+# (their names are recorded permanently and never re-downloaded) and their
+# tiles are freed after a safety gap, making room for new frames. The model
+# trains on a continuously rotating set of frames it has never seen.
+ROLLING="${ROLLING:-0}"
+ROLLING_WINDOW="${ROLLING_WINDOW:-1100}"   # frames kept on disk (rolling mode)
+LR="${LR:-}"                     # optional learning rate for the streaming trainer
+                                  # (rolling runs use a lower LR, e.g. 1e-4, so
+                                  # updates overwrite less of the old knowledge)
+
 # CPU headroom = cores left idle for the OS + to keep the machine cool.
 # Default: 2 cores idle on macOS (8 of 10 cores train — maximum speed that
 # still leaves the machine usable), 2 on Linux. Override with CPU_HEADROOM=N:
@@ -420,7 +432,7 @@ session_banner() {
     log "GPU      : $GPU_INFO"
     log "Data dir : $DATA_DIR"
     log "Results  : $RESULTS_DIR"
-    log "Config   : channels=$CHANNELS split=$MASK_SPLIT epochs=$EPOCHS frames/cycle=$FRAMES_PER_CYCLE max_frames=$MAX_TOTAL_FRAMES patch=$PATCH_SIZE min_free=${MIN_FREE_GB}GB cycles=${MAX_CYCLES}"
+    log "Config   : channels=$CHANNELS split=$MASK_SPLIT epochs=$EPOCHS frames/cycle=$FRAMES_PER_CYCLE max_frames=$MAX_TOTAL_FRAMES patch=$PATCH_SIZE min_free=${MIN_FREE_GB}GB cycles=${MAX_CYCLES} rolling=$ROLLING window=$ROLLING_WINDOW lr=${LR:-default}"
     log "Log      : $LOG   (watch: tail -f $LOG)"
     log "Status   : $STATUS"
     hr
@@ -629,6 +641,8 @@ downloader_loop() {
             continue
         fi
         log "Downloader: batch start ($FRAMES frames on disk, adding up to $FRAMES_PER_CYCLE more)"
+        ROLLING_ARG=""
+        [[ "$ROLLING" == "1" ]] && ROLLING_ARG="--rolling --rolling-window $ROLLING_WINDOW"
         if ! "$PY" "$REPO_DIR/scripts/build_arpil_resumable.py" \
             --output-dir "$DATA_DIR" \
             --split "$MASK_SPLIT" \
@@ -637,6 +651,7 @@ downloader_loop() {
             --min-mask-fraction "$MIN_MASK_FRACTION" --keep-empty-every "$KEEP_EMPTY_EVERY" \
             --max-frames "$FRAMES_PER_CYCLE" --sampling random \
             --download-workers "$DOWNLOAD_WORKERS" \
+            $ROLLING_ARG \
             --min-free-disk-gb "$MIN_FREE_GB"; then
             # A crash (e.g. segfault in a native library) leaves the batch's
             # temp .nc files orphaned — they would sit in $TMPDIR for days.
@@ -672,12 +687,15 @@ if [[ "$CONTINUOUS" == "1" ]]; then
     [[ "$CALIBRATE_BEST" == "1" ]] && CALIBRATE_ARG="--calibrate-best"
     DEEP_SUPERVISION_ARG=""
     [[ "$DEEP_SUPERVISION" == "1" ]] && DEEP_SUPERVISION_ARG="--deep-supervision"
+    LR_ARG=""
+    [[ -n "$LR" ]] && LR_ARG="--lr $LR"
     "$PY" "$REPO_DIR/scripts/train_streaming.py" \
         --manifest "$DATA_DIR/manifest.csv" \
         --channels "$CHANNELS" \
         --image-size "$PATCH_SIZE" \
         --base-channels "$BASE_CHANNELS" \
         $DEEP_SUPERVISION_ARG \
+        $LR_ARG \
         --output-dir "$RESULTS_DIR/continuous" \
         --val-every "$VAL_EPOCH" \
         --max-tiles-per-epoch "$TILES_PER_EPOCH" \

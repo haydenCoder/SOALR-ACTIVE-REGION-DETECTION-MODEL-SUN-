@@ -49,6 +49,7 @@ class SolarActiveRegionDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         self.augment = augment
         self.intensity_augment = intensity_augment
         self.random = random.Random(seed)
+        self._missing_warns = 0
         # Dataset/variable names used for container formats (HDF5, netCDF, npz).
         # A ``path#key`` suffix in the manifest overrides these per file.
         self.hdf5_image_key = hdf5_image_key
@@ -175,9 +176,33 @@ class SolarActiveRegionDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def _load_sample(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         record = self.records[index]
-        channels = [self._load_image(path, self.hdf5_image_key) for path in record.image_paths]
-        image = np.stack(channels, axis=0).astype(np.float32)
-        mask = self._load_image(record.mask_path, self.hdf5_mask_key).astype(np.float32)
+        try:
+            channels = [self._load_image(path, self.hdf5_image_key) for path in record.image_paths]
+            image = np.stack(channels, axis=0).astype(np.float32)
+            mask = self._load_image(record.mask_path, self.hdf5_mask_key).astype(np.float32)
+        except FileNotFoundError:
+            # Rolling-window rotations delete a frame's tiles only after a
+            # multi-hour grace gap, but an epoch that started just before the
+            # rotation can still hold a reference to them. Substitute a
+            # neutral background sample (normalizes to flat) instead of
+            # crashing the whole run over one rotated-out tile.
+            if self._missing_warns < 3:
+                self._missing_warns += 1
+                print(
+                    f"[data] tile file missing (rotated out?) near {record.mask_path} "
+                    f"— using background substitute for this sample",
+                    flush=True,
+                )
+            h = w = 512
+            for path in [record.mask_path, *record.image_paths]:
+                try:
+                    arr = self._load_image(path, self.hdf5_mask_key)
+                    h, w = arr.shape[:2]
+                    break
+                except FileNotFoundError:
+                    continue
+            image = np.zeros((len(record.image_paths), h, w), dtype=np.float32)
+            mask = np.zeros((h, w), dtype=np.float32)
 
         image = self._normalize(image)
         mask = (mask > self.mask_threshold).astype(np.float32)[None, ...]
