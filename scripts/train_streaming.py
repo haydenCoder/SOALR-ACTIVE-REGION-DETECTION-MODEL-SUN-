@@ -222,12 +222,17 @@ def main() -> None:
     ).to(device)
 
     # C-level graph engine with the same smoke-tested fallback as train.py.
+    # dynamic=False: shapes are fixed per run (image size, channels, batch
+    # size), and static shapes avoid the inductor symbolic-shape codegen bug
+    # that breaks torch.compile on MPS ("cannot determine truth value of
+    # Relational" in WelfordReduction). Only the final partial batch differs,
+    # which costs a couple of one-time re-compiles.
     compile_enabled = False
     if args.torch_compile:
         try:
             with torch.no_grad():
                 dummy = torch.zeros(2, len(args.channels), min(args.image_size, 64), min(args.image_size, 64), device=device)
-                model = torch.compile(model, dynamic=True)
+                model = torch.compile(model, dynamic=False)
                 _ = model(dummy)
             compile_enabled = True
             print("[compile] torch.compile active (C-level graph engine)", flush=True)

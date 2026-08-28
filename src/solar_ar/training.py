@@ -414,8 +414,14 @@ class Trainer:
         # further 1.2-1.5x on top of the bfloat16 autocast. It is validated
         # with a smoke forward BEFORE training starts, and any failure falls
         # back to eager mode — an unattended cycle must never die on a
-        # compiler bug. dynamic=True keeps the varying last-batch size from
-        # forcing re-compiles.
+        # compiler bug. dynamic=False (static shapes): within one run the
+        # image size, channel count and batch size are all fixed, so nothing
+        # actually varies — except the final partial batch, which costs a
+        # couple of one-time re-compiles. Static shapes also sidestep a
+        # known inductor bug that only triggers on symbolic (dynamic)
+        # shapes (e.g. MPS: "cannot determine truth value of Relational"
+        # in WelfordReduction codegen), so compilation is far more likely
+        # to succeed.
         self.compile_enabled = False
         if torch_compile and torch.cuda.device_count() <= 1:
             try:
@@ -423,7 +429,7 @@ class Trainer:
                     dummy = torch.zeros(2, len(channels), image_size, image_size, device=self.device)
                     if self.channels_last:
                         dummy = dummy.to(memory_format=torch.channels_last)
-                    self.model = torch.compile(self.model, dynamic=True)
+                    self.model = torch.compile(self.model, dynamic=False)
                     _ = self.model(dummy)
                 self.compile_enabled = True
                 print("[compile] torch.compile active (C-level graph engine) — the first epoch includes one-time graph capture")
