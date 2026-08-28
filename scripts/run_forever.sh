@@ -70,13 +70,20 @@ EPOCHS=15                  # fast passes during the collection phase
 EPOCHS_FINAL=60            # deep passes once the download cap is reached
 FRAMES_PER_CYCLE=200       # NEW frames to add each cycle (may be auto-reduced)
 MAX_TOTAL_FRAMES=2000      # stop downloading beyond this (0 = no cap)
-# Tiles sampled PER EPOCH (0 = use the whole dataset every epoch). MPS is the
-# bottleneck, so capping each epoch at a random subset keeps epochs ~10-15 min
-# and CONSTANT no matter how much data has been collected — the full dataset
-# is still covered across successive epochs (each tile is seen randomly, like
-# a very large mini-batch). Validation ALWAYS uses the full val set, so the
-# best.pt bar stays honest.
-TILES_PER_EPOCH="${TILES_PER_EPOCH:-1500}"
+# Tiles sampled PER EPOCH (0 = use the whole dataset every epoch). With
+# subsampling + constant LR, this number does NOT change how fast the model
+# learns — MPS processes tiles at a fixed rate regardless of the chunk size.
+# It only sets the epoch GRANULARITY: smaller = more, shorter epochs (finer
+# random shuffling, faster progress ticks).
+#
+# VALIDATION: a FULL validation on the grown val set (with TTA) takes ~1 hour
+# and used to eat ~80% of the wall clock. So the streaming trainer validates
+# on a fixed random VAL_SUBSET slice WITHOUT TTA (~1-2 min), every VAL_EPOCH
+# short epochs. best.pt tracks that consistent quick bar; for the FINAL
+# official number, run evaluate.py on the full val set at the end.
+TILES_PER_EPOCH="${TILES_PER_EPOCH:-100}"
+VAL_EPOCH="${VAL_EPOCH:-10}"
+VAL_SUBSET="${VAL_SUBSET:-300}"
 MAX_CYCLES=100000          # effectively "forever"
 MIN_FREE_GB=40             # refuse to download when free disk drops below this
 CYCLE_PAUSE=60             # seconds between cycles (lets the disk settle)
@@ -632,8 +639,9 @@ if [[ "$CONTINUOUS" == "1" ]]; then
         --channels "$CHANNELS" \
         --image-size "$PATCH_SIZE" \
         --output-dir "$RESULTS_DIR/continuous" \
-        --val-every 2 \
+        --val-every "$VAL_EPOCH" \
         --max-tiles-per-epoch "$TILES_PER_EPOCH" \
+        --val-subset "$VAL_SUBSET" \
         --status-file "$STATUS" \
         --cpu-headroom "$CPU_HEADROOM" --memory-budget-gb 0 \
         $CALIBRATE_ARG

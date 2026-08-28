@@ -74,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
              "Keeps epochs fast and constant as the dataset grows; the full dataset is "
              "still covered across successive epochs. Validation is ALWAYS the full val set.",
     )
+    p.add_argument(
+        "--val-subset", type=int, default=0,
+        help="Validate on a fixed random subset of this size from the val set instead of "
+             "the whole val set (0 = full). A full validation on a grown val set with TTA "
+             "can take an hour — a 300-tile quick validation takes ~1-2 min and keeps the "
+             "best.pt bar fresh. The bar is consistent within a dataset generation; run "
+             "evaluate.py on the full val set for the final number.",
+    )
     p.add_argument("--max-epochs", type=int, default=0, help="0 = train forever until stopped")
     p.add_argument("--min-samples", type=int, default=4, help="Wait until the manifest has at least this many train samples")
     p.add_argument("--seed", type=int, default=42)
@@ -261,7 +269,7 @@ def main() -> None:
 
     manifest = Path(args.manifest)
     manifest_mtime: float | None = None
-    train_loader: DataLoader | None = None
+    train_ds = None
     val_loader: DataLoader | None = None
     n_train = n_val = 0
     t_start = time.time()
@@ -273,7 +281,7 @@ def main() -> None:
         # downloader after every completed frame, so an mtime change means
         # "new frames are available" — rebuild the dataset, keep training.
         mtime = manifest.stat().st_mtime if manifest.exists() else None
-        if train_loader is None or mtime != manifest_mtime:
+        if train_ds is None or mtime != manifest_mtime:
             try:
                 train_ds = SolarActiveRegionDataset(
                     manifest_path=manifest, channels=args.channels, split="train",
@@ -301,11 +309,21 @@ def main() -> None:
             }
             if plan.dataloader_workers > 0:
                 loader_kwargs["prefetch_factor"] = 8
-            val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
+            # Quick validation: a fixed random slice of the val set (drawn once per
+            # dataset generation) instead of the whole set — a full validation on a
+            # grown val set with TTA can take an hour and starve training.
+            val_eval_ds = val_ds
+            val_eval_n = n_val
+            if args.val_subset > 0 and n_val > args.val_subset:
+                val_idx = random.Random(args.seed).sample(range(n_val), args.val_subset)
+                val_eval_ds = Subset(val_ds, val_idx)
+                val_eval_n = args.val_subset
+            val_loader = DataLoader(val_eval_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
             # (the train loader is built per epoch, below, so it can sample a
             #  random subset of the dataset when --max-tiles-per-epoch is set)
             manifest_mtime = mtime
-            print(f"[stream] dataset refreshed: {n_train} train / {n_val} val tiles — new frames now included automatically", flush=True)
+            sub_note = f" (validating on {val_eval_n}/{n_val} quick subset)" if val_eval_n < n_val else ""
+            print(f"[stream] dataset refreshed: {n_train} train / {n_val} val tiles{sub_note} — new frames now included automatically", flush=True)
 
         # ---- one epoch of continuous training
         epoch += 1
@@ -366,6 +384,9 @@ def main() -> None:
 
         if epoch % args.val_every == 0 and val_loader is not None:
             # Validate with the EMA weights — those are what best.pt tracks.
+            # Quick subset validation runs without TTA (4 views would cost 4x);
+            # full validation keeps the configured TTA.
+            val_transforms = args.tta if val_eval_n >= n_val else "none"
             backup = ema.copy_to(model)
             model.eval()
             dice_sum = iou_sum = 0.0
@@ -377,7 +398,7 @@ def main() -> None:
                     images = images.to(device, non_blocking=True)
                     masks = masks.to(device, non_blocking=True)
                     probs = tta_predict(
-                        model, images, transforms=args.tta,
+                        model, images, transforms=val_transforms,
                         autocast_kwargs={"device_type": autocast_type, "enabled": amp_enabled},
                     )
                     d, i = compute_metrics_from_probs(probs, masks)
@@ -387,7 +408,8 @@ def main() -> None:
             model.load_state_dict(backup)
             val_dice = dice_sum / max(vb, 1)
             val_iou = iou_sum / max(vb, 1)
-            line += f" val_dice={val_dice:.4f} val_iou={val_iou:.4f}"
+            quick_note = f" ({val_eval_n} quick)" if val_eval_n < n_val else ""
+            line += f" val_dice={val_dice:.4f} val_iou={val_iou:.4f}{quick_note}"
             if calibrate_pending:
                 calibrate_pending = False
                 best_dice = val_dice
