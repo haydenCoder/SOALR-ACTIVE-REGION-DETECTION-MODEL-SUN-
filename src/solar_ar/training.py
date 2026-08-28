@@ -422,8 +422,14 @@ class Trainer:
         # shapes (e.g. MPS: "cannot determine truth value of Relational"
         # in WelfordReduction codegen), so compilation is far more likely
         # to succeed.
+        # SKIPPED ON MPS: inductor-MPS in torch 2.8 compiles 512^2 graphs in
+        # 15-30+ min (per batch size), can hang the trainer, and produced a
+        # NaN loss on the first compiled epoch — eager + bfloat16 autocast is
+        # the proven path on Apple Silicon. CUDA keeps torch.compile.
         self.compile_enabled = False
-        if torch_compile and torch.cuda.device_count() <= 1:
+        if torch_compile and self.device.type == "mps":
+            print("[compile] skipped on MPS (Apple Silicon) — using eager + bfloat16 autocast")
+        elif torch_compile and torch.cuda.device_count() <= 1:
             try:
                 with torch.no_grad():
                     dummy = torch.zeros(2, len(channels), image_size, image_size, device=self.device)

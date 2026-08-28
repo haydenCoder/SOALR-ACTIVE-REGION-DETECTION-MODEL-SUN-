@@ -227,8 +227,17 @@ def main() -> None:
     # that breaks torch.compile on MPS ("cannot determine truth value of
     # Relational" in WelfordReduction). Only the final partial batch differs,
     # which costs a couple of one-time re-compiles.
+    #
+    # SKIPPED ON MPS (Apple Silicon): torch 2.8's inductor-MPS backend is
+    # unreliable in practice — each 512^2 graph takes 15-30+ min to compile
+    # (one-time re-compiles per batch size), the compile can hang the whole
+    # trainer, and the first compiled epoch produced a NaN loss. Eager mode
+    # with bfloat16 autocast is the proven, hang-free path on Apple Silicon
+    # (CUDA keeps torch.compile — its inductor backend is mature).
     compile_enabled = False
-    if args.torch_compile:
+    if args.torch_compile and device.type == "mps":
+        print("[compile] skipped on MPS (Apple Silicon) — inductor-MPS is unreliable in torch 2.8 (slow/hanging compiles, NaN); using eager + bfloat16 autocast", flush=True)
+    elif args.torch_compile:
         try:
             with torch.no_grad():
                 dummy = torch.zeros(2, len(args.channels), min(args.image_size, 64), min(args.image_size, 64), device=device)
