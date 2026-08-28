@@ -22,9 +22,9 @@
 #
 # In both modes it:
 #   1. Detects your hardware and uses maximum power: every core minus a
-#      cooling headroom (4 cores on macOS so the machine stays cool over
-#      multi-day runs, 2 on Linux) and all RAM (Apple Silicon also uses the
-#      MPS GPU),
+#      cooling headroom (2 cores idle on macOS by default — 8 of 10 cores
+#      train — override with CPU_HEADROOM=N) and all RAM (Apple Silicon also
+#      uses the MPS GPU),
 #        - patch size is chosen from RAM (512 if >=12 GB, else 256),
 #        - how much data to download is chosen from free disk.
 #   2. Downloads ARPIL tiles a little at a time (resumable, never redownloads).
@@ -70,6 +70,13 @@ EPOCHS=15                  # fast passes during the collection phase
 EPOCHS_FINAL=60            # deep passes once the download cap is reached
 FRAMES_PER_CYCLE=200       # NEW frames to add each cycle (may be auto-reduced)
 MAX_TOTAL_FRAMES=2000      # stop downloading beyond this (0 = no cap)
+# Tiles sampled PER EPOCH (0 = use the whole dataset every epoch). MPS is the
+# bottleneck, so capping each epoch at a random subset keeps epochs ~10-15 min
+# and CONSTANT no matter how much data has been collected — the full dataset
+# is still covered across successive epochs (each tile is seen randomly, like
+# a very large mini-batch). Validation ALWAYS uses the full val set, so the
+# best.pt bar stays honest.
+TILES_PER_EPOCH="${TILES_PER_EPOCH:-1500}"
 MAX_CYCLES=100000          # effectively "forever"
 MIN_FREE_GB=40             # refuse to download when free disk drops below this
 CYCLE_PAUSE=60             # seconds between cycles (lets the disk settle)
@@ -106,11 +113,12 @@ KEEP_EMPTY_EVERY=64
 DOWNLOAD_WORKERS="${DOWNLOAD_WORKERS:-16}"
 
 # CPU headroom = cores left idle for the OS + to keep the machine cool.
-# A multi-day full-throttle run cooks a Mac, so macOS defaults to 4 cores of
-# headroom (Linux keeps 2 — those boxes are usually dedicated). Override with
-# CPU_HEADROOM=N (e.g. CPU_HEADROOM=6 for an even cooler, slower run).
+# Default: 2 cores idle on macOS (8 of 10 cores train — maximum speed that
+# still leaves the machine usable), 2 on Linux. Override with CPU_HEADROOM=N:
+#   CPU_HEADROOM=1 -> 9 training cores (faster, machine feels busy)
+#   CPU_HEADROOM=4 -> 6 training cores (cooler/slower)
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    CPU_HEADROOM="${CPU_HEADROOM:-4}"
+    CPU_HEADROOM="${CPU_HEADROOM:-2}"
 else
     CPU_HEADROOM="${CPU_HEADROOM:-2}"
 fi
@@ -625,6 +633,7 @@ if [[ "$CONTINUOUS" == "1" ]]; then
         --image-size "$PATCH_SIZE" \
         --output-dir "$RESULTS_DIR/continuous" \
         --val-every 2 \
+        --max-tiles-per-epoch "$TILES_PER_EPOCH" \
         --status-file "$STATUS" \
         --cpu-headroom "$CPU_HEADROOM" --memory-budget-gb 0 \
         $CALIBRATE_ARG

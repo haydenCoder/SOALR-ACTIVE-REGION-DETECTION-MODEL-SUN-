@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import signal
 import sys
 import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -67,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--batch-size", type=int, default=0, help="0 = auto from the memory budget")
     p.add_argument("--val-every", type=int, default=2, help="Validate (and update best.pt) every N epochs")
+    p.add_argument(
+        "--max-tiles-per-epoch", type=int, default=0,
+        help="Randomly train on at most this many tiles per epoch (0 = whole dataset). "
+             "Keeps epochs fast and constant as the dataset grows; the full dataset is "
+             "still covered across successive epochs. Validation is ALWAYS the full val set.",
+    )
     p.add_argument("--max-epochs", type=int, default=0, help="0 = train forever until stopped")
     p.add_argument("--min-samples", type=int, default=4, help="Wait until the manifest has at least this many train samples")
     p.add_argument("--seed", type=int, default=42)
@@ -294,8 +301,9 @@ def main() -> None:
             }
             if plan.dataloader_workers > 0:
                 loader_kwargs["prefetch_factor"] = 8
-            train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
             val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
+            # (the train loader is built per epoch, below, so it can sample a
+            #  random subset of the dataset when --max-tiles-per-epoch is set)
             manifest_mtime = mtime
             print(f"[stream] dataset refreshed: {n_train} train / {n_val} val tiles — new frames now included automatically", flush=True)
 
@@ -312,10 +320,26 @@ def main() -> None:
         for group in optimizer.param_groups:
             group["lr"] = lr
 
+        # ---- pick this epoch's training data
+        # With --max-tiles-per-epoch, each epoch trains on a random subset of
+        # the dataset (like a very large mini-batch): epochs stay fast and
+        # CONSTANT as the dataset grows, and every tile is still seen
+        # repeatedly across epochs in random order. Without it, the whole
+        # dataset is used. Validation below is always the FULL val set.
+        k = args.max_tiles_per_epoch
+        if k > 0 and n_train > k:
+            indices = random.Random(args.seed + epoch * 7919).sample(range(n_train), k)
+            epoch_ds = Subset(train_ds, indices)
+            samples_this_epoch = k
+        else:
+            epoch_ds = train_ds
+            samples_this_epoch = n_train
+        epoch_loader = DataLoader(epoch_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
+
         model.train(True)
         t0 = time.time()
         loss_sum, n_batches = 0.0, 0
-        for images, masks in train_loader:
+        for images, masks in epoch_loader:
             if stop["flag"]:
                 break
             images = images.to(device, non_blocking=True)
@@ -336,7 +360,8 @@ def main() -> None:
 
         avg_loss = loss_sum / max(n_batches, 1)
         seconds = time.time() - t0
-        line = (f"epoch={epoch:04d} loss={avg_loss:.4f} samples={n_train} lr={lr:.2e} {seconds:.0f}s "
+        line = (f"epoch={epoch:04d} loss={avg_loss:.4f} "
+                f"samples={samples_this_epoch}/{n_train} lr={lr:.2e} {seconds:.0f}s "
                 f"(run time {int((time.time() - t_start) // 60)} min)")
 
         if epoch % args.val_every == 0 and val_loader is not None:
