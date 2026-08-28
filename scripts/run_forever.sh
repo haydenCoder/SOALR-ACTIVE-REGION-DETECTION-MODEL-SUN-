@@ -70,11 +70,16 @@ CHANNELS="${CHANNELS:-aia171}"   # wavelength(s) to train on. The plasma-physics
                                   # $DATA_DIR and the old checkpoints).
 BASE_CHANNELS="${BASE_CHANNELS:-32}"  # model width: 32 (≈8M params, default) or 16
                                        # (≈2M, ~2x faster epochs — for short windows)
+DEEP_SUPERVISION="${DEEP_SUPERVISION:-0}"  # 1 = auxiliary losses on decoder stages
+                                           # (better small/thin structure recall,
+                                           # ~10-15% slower per epoch — usually worth it)
 # MAXIMUM-SPEED preset (M4 Mac, all 13 channels, no headroom):
 #   CHANNELS="aia94 aia131 aia1600 aia171 aia193 aia211 aia304 aia335 hmi_m hmi_bx hmi_by hmi_bz hmi_v" \
 #   CPU_HEADROOM=0 TILES_PER_EPOCH=200 VAL_EPOCH=5 VAL_SUBSET=500 \
 #   bash scripts/run_forever.sh
 # (expect a hot machine and spinning fans — that is the trade-off of 10/10 cores)
+# BEST-MODEL preset (best quality per image size for ~6k tiles on MPS):
+#   ...plus BASE_CHANNELS=48 DEEP_SUPERVISION=1  (~18M params + deep supervision)
 MASK_SPLIT="${MASK_SPLIT:-train}"  # ARPIL split to mine: train|validation|test|leaky_validation
 # Two-phase training, tuned for short deadlines (e.g. a 3-day window):
 #   - while data is still being collected: FAST passes (EPOCHS), so each cycle
@@ -649,11 +654,14 @@ if [[ "$CONTINUOUS" == "1" ]]; then
     DOWNLOADER_PID=$!
     CALIBRATE_ARG=""
     [[ "$CALIBRATE_BEST" == "1" ]] && CALIBRATE_ARG="--calibrate-best"
+    DEEP_SUPERVISION_ARG=""
+    [[ "$DEEP_SUPERVISION" == "1" ]] && DEEP_SUPERVISION_ARG="--deep-supervision"
     "$PY" "$REPO_DIR/scripts/train_streaming.py" \
         --manifest "$DATA_DIR/manifest.csv" \
         --channels "$CHANNELS" \
         --image-size "$PATCH_SIZE" \
         --base-channels "$BASE_CHANNELS" \
+        $DEEP_SUPERVISION_ARG \
         --output-dir "$RESULTS_DIR/continuous" \
         --val-every "$VAL_EPOCH" \
         --max-tiles-per-epoch "$TILES_PER_EPOCH" \

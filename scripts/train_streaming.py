@@ -40,6 +40,7 @@ from solar_ar.runtime import (  # noqa: E402
 from solar_ar.training import (  # noqa: E402
     BCEDiceLoss,
     ComboLoss,
+    DeepSupervisionLoss,
     FocalTverskyLoss,
     ModelEma,
     compute_metrics_from_probs,
@@ -86,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-samples", type=int, default=4, help="Wait until the manifest has at least this many train samples")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--loss", choices=["bce_dice", "focal_tversky", "combo"], default="bce_dice")
+    p.add_argument(
+        "--deep-supervision", action="store_true",
+        help="Auxiliary losses on intermediate decoder stages: pushes gradient into the "
+             "deep layers and improves recall of small/thin structures (active regions "
+             "and polarity inversion lines). ~10-15% slower per epoch, usually worth it.",
+    )
     p.add_argument("--tta", choices=["none", "flips", "d4"], default="flips")
     p.add_argument("--cpu-budget", type=int, default=0, help="0 = auto (every core minus headroom)")
     p.add_argument("--cpu-headroom", type=int, default=2)
@@ -104,12 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def build_criterion(name: str):
+def build_criterion(name: str, deep_supervision: bool = False):
     if name == "focal_tversky":
-        return FocalTverskyLoss()
-    if name == "combo":
-        return ComboLoss()
-    return BCEDiceLoss()
+        loss = FocalTverskyLoss()
+    elif name == "combo":
+        loss = ComboLoss()
+    else:
+        loss = BCEDiceLoss()
+    if deep_supervision:
+        return DeepSupervisionLoss(loss)
+    return loss
 
 
 def load_last(path: Path, model, optimizer, ema, device) -> tuple[int, float, float | None]:
@@ -199,6 +210,7 @@ def main() -> None:
         out_channels=1,
         base_channels=args.base_channels,
         dropout=args.dropout,
+        deep_supervision=args.deep_supervision,
     ).to(device)
 
     # C-level graph engine with the same smoke-tested fallback as train.py.
@@ -215,13 +227,14 @@ def main() -> None:
             model = AttentionUNet(
                 in_channels=len(args.channels), out_channels=1,
                 base_channels=args.base_channels, dropout=args.dropout,
+                deep_supervision=args.deep_supervision,
             ).to(device)
             print(f"[compile] torch.compile unavailable ({type(exc).__name__}: {exc}) — continuing in eager mode", flush=True)
 
     ema = ModelEma(model, decay=0.999)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
-    criterion = build_criterion(args.loss)
+    criterion = build_criterion(args.loss, deep_supervision=args.deep_supervision)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
