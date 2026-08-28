@@ -59,7 +59,22 @@ DATA_DIR="$HOME/solar_data/arpil"          # train tiles + manifest live here
 RESULTS_DIR="$HOME/solar_results/arpil"    # checkpoints + metrics live here
 TEST_DIR="$HOME/solar_data/arpil_test"     # OFFICIAL test-split tiles (optional)
 
-CHANNELS="aia171"          # wavelength(s) to train on (ARPIL manifest column name)
+CHANNELS="${CHANNELS:-aia171}"   # wavelength(s) to train on. The plasma-physics
+                                  # stack "aia171 aia193 hmi_m" (cool loops + hot
+                                  # plasma + magnetic field) is the strongest input
+                                  # for a from-scratch model — active regions are
+                                  # defined by the field. The full 13-channel core
+                                  # stack (all 8 AIA EUV + all 5 HMI field
+                                  # channels) is the maximum-info option. Changing
+                                  # CHANNELS means the tiles must be rebuilt (wipe
+                                  # $DATA_DIR and the old checkpoints).
+BASE_CHANNELS="${BASE_CHANNELS:-32}"  # model width: 32 (≈8M params, default) or 16
+                                       # (≈2M, ~2x faster epochs — for short windows)
+# MAXIMUM-SPEED preset (M4 Mac, all 13 channels, no headroom):
+#   CHANNELS="aia94 aia131 aia1600 aia171 aia193 aia211 aia304 aia335 hmi_m hmi_bx hmi_by hmi_bz hmi_v" \
+#   CPU_HEADROOM=0 TILES_PER_EPOCH=200 VAL_EPOCH=5 VAL_SUBSET=500 \
+#   bash scripts/run_forever.sh
+# (expect a hot machine and spinning fans — that is the trade-off of 10/10 cores)
 MASK_SPLIT="${MASK_SPLIT:-train}"  # ARPIL split to mine: train|validation|test|leaky_validation
 # Two-phase training, tuned for short deadlines (e.g. a 3-day window):
 #   - while data is still being collected: FAST passes (EPOCHS), so each cycle
@@ -638,6 +653,7 @@ if [[ "$CONTINUOUS" == "1" ]]; then
         --manifest "$DATA_DIR/manifest.csv" \
         --channels "$CHANNELS" \
         --image-size "$PATCH_SIZE" \
+        --base-channels "$BASE_CHANNELS" \
         --output-dir "$RESULTS_DIR/continuous" \
         --val-every "$VAL_EPOCH" \
         --max-tiles-per-epoch "$TILES_PER_EPOCH" \
@@ -732,6 +748,7 @@ while [[ $CYCLE -le $MAX_CYCLES ]]; do
         --manifest "$DATA_DIR/manifest.csv" \
         --channels "$CHANNELS" \
         --image-size "$PATCH_SIZE" \
+        --base-channels "$BASE_CHANNELS" \
         --epochs "$CYCLE_EPOCHS" --patience 0 \
         --cpu-headroom "$CPU_HEADROOM" --memory-headroom-gb 0 \
         --output-dir "$OUT"
