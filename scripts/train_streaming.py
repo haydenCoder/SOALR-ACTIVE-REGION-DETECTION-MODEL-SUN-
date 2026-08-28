@@ -205,7 +205,11 @@ def main() -> None:
     print(f"[stream] mixed precision: autocast={autocast_type} enabled={amp_enabled} scaler={scaler_enabled}", flush=True)
 
     batch_size = args.batch_size or suggest_batch_size(
-        args.image_size, len(args.channels), args.base_channels, plan.memory_budget_gb * 0.55
+        args.image_size,
+        len(args.channels),
+        args.base_channels,
+        plan.memory_budget_gb * 0.55,
+        data_parallel=False,  # this trainer runs on ONE GPU — never inflate the batch
     )
     print(f"[stream] batch_size={batch_size} (auto)", flush=True)
 

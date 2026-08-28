@@ -80,6 +80,15 @@ DEEP_SUPERVISION="${DEEP_SUPERVISION:-0}"  # 1 = auxiliary losses on decoder sta
 # (expect a hot machine and spinning fans — that is the trade-off of 10/10 cores)
 # BEST-MODEL preset (best quality per image size for ~6k tiles on MPS):
 #   ...plus BASE_CHANNELS=48 DEEP_SUPERVISION=1  (~18M params + deep supervision)
+# KAGGLE preset (T4 GPU, 20 GB working disk, 12-hour sessions — just re-run
+# the same notebook cell after each session kill; data + checkpoints resume):
+#   export HOME=/kaggle/work
+#   CHANNELS="aia94 aia131 aia1600 aia171 aia193 aia211 aia304 aia335 hmi_m hmi_bx hmi_by hmi_bz hmi_v" \
+#   MIN_FREE_GB=4 MAX_TOTAL_FRAMES=1500 DOWNLOAD_WORKERS=4 \
+#   CPU_HEADROOM=2 TILES_PER_EPOCH=200 VAL_EPOCH=10 VAL_SUBSET=300 \
+#   bash scripts/run_forever.sh
+# (fewer download workers: each in-flight frame holds a ~570 MB temp file, and
+# Kaggle's whole working disk is ~20 GB; 4 workers ≈ 2.4 GB in flight)
 MASK_SPLIT="${MASK_SPLIT:-train}"  # ARPIL split to mine: train|validation|test|leaky_validation
 # Two-phase training, tuned for short deadlines (e.g. a 3-day window):
 #   - while data is still being collected: FAST passes (EPOCHS), so each cycle
@@ -88,8 +97,8 @@ MASK_SPLIT="${MASK_SPLIT:-train}"  # ARPIL split to mine: train|validation|test|
 #     complete dataset — this is where the final model quality comes from
 EPOCHS=15                  # fast passes during the collection phase
 EPOCHS_FINAL=60            # deep passes once the download cap is reached
-FRAMES_PER_CYCLE=200       # NEW frames to add each cycle (may be auto-reduced)
-MAX_TOTAL_FRAMES=2000      # stop downloading beyond this (0 = no cap)
+FRAMES_PER_CYCLE="${FRAMES_PER_CYCLE:-200}"   # NEW frames to add each cycle (may be auto-reduced)
+MAX_TOTAL_FRAMES="${MAX_TOTAL_FRAMES:-2000}"  # stop downloading beyond this (0 = no cap)
 # Tiles sampled PER EPOCH (0 = use the whole dataset every epoch). With
 # subsampling + constant LR, this number does NOT change how fast the model
 # learns — MPS processes tiles at a fixed rate regardless of the chunk size.
@@ -105,7 +114,9 @@ TILES_PER_EPOCH="${TILES_PER_EPOCH:-100}"
 VAL_EPOCH="${VAL_EPOCH:-10}"
 VAL_SUBSET="${VAL_SUBSET:-300}"
 MAX_CYCLES=100000          # effectively "forever"
-MIN_FREE_GB=40             # refuse to download when free disk drops below this
+MIN_FREE_GB="${MIN_FREE_GB:-40}"    # refuse to download when free disk drops below this
+                                  # (small machines such as Kaggle's 20 GB working
+                                  # disk need MIN_FREE_GB=4 — see the KAGGLE preset)
 CYCLE_PAUSE=60             # seconds between cycles (lets the disk settle)
 WATCH_EVERY=300            # resource watchdog interval, seconds
 

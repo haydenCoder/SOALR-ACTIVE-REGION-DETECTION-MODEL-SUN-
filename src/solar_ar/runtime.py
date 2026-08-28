@@ -390,6 +390,7 @@ def suggest_batch_size(
     memory_budget_gb: float,
     minimum: int = 1,
     maximum: int = 64,
+    data_parallel: bool = True,
 ) -> int:
     """Estimate the largest batch that fits the RAM budget.
 
@@ -415,7 +416,14 @@ def suggest_batch_size(
     estimate = int(usable // max(bytes_per_sample, 1))
 
     # DataParallel takes a global batch, distributed across the visible GPUs.
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    # A single-GPU trainer (data_parallel=False, e.g. the streaming trainer)
+    # runs the WHOLE batch on one GPU, so inflating it by the visible-GPU
+    # count would OOM one of them (e.g. Kaggle's T4x2 runtime).
+    num_gpus = (
+        torch.cuda.device_count()
+        if torch.cuda.is_available() and data_parallel
+        else 1
+    )
     if num_gpus > 1:
         estimate *= num_gpus
 
