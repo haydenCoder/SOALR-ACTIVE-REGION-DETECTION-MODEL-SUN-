@@ -202,6 +202,10 @@ def extract_masks_batch(archive_path: Path, needed_rel_paths: list[str], extract
 
 def main() -> None:
     args = build_parser().parse_args()
+    # Tolerate a single quoted multi-word --channels argument (e.g.
+    # --channels "aia94 aia131 ..."), which argparse would otherwise treat
+    # as one channel name.
+    args.channels = [c for part in args.channels for c in part.split()]
     raise_file_limit()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

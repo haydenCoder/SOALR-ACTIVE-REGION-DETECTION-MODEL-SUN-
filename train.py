@@ -242,6 +242,10 @@ def bootstrap_data() -> str:
 
 def main() -> None:
     args = build_parser().parse_args()
+    # Tolerate a single quoted multi-word --channels argument (e.g.
+    # --channels "aia94 aia131 ..."), which argparse would otherwise treat
+    # as one channel name.
+    args.channels = [c for part in args.channels for c in part.split()]
 
     if args.manifest is None:
         args.manifest = bootstrap_data()
