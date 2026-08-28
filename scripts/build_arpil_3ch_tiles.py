@@ -174,7 +174,16 @@ def load_mask(h5_path: Path, key: str) -> np.ndarray:
 
 
 def save_compressed(path: Path, array: np.ndarray) -> None:
-    np.savez_compressed(path, array.astype(np.float32))
+    # Store tiles in float16: the training pipeline re-normalizes at load
+    # time (percentile scaling), so half the mantissa digits are more than
+    # enough — and the tile disk footprint halves (~90 MB -> ~45 MB per
+    # 13-channel frame, ~21 MB -> ~11 MB per 3-channel frame). This is what
+    # lets Kaggle's 20 GiB working quota hold ~1,000 frames instead of ~550.
+    # Values are clipped into the float16 range first (bright EUV counts can
+    # exceed 65504); the load-time percentile clipping makes the lost extreme
+    # tail immaterial. The loader is dtype-agnostic (astype float32), so
+    # float16 and legacy float32 tiles coexist in the same dataset.
+    np.savez_compressed(path, np.clip(array, -65000, 65000).astype(np.float16))
 
 
 def core_key_from_mask_path(mask_path: str) -> str:
