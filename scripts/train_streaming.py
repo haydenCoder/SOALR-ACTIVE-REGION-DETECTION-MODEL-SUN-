@@ -370,12 +370,18 @@ def main() -> None:
                     time.sleep(15)
                 continue
             loader_kwargs = {
-                "num_workers": plan.dataloader_workers,
+                "num_workers": min(plan.dataloader_workers, 6),
                 "pin_memory": plan.pin_memory,
-                "persistent_workers": plan.dataloader_workers > 0,
+                # persistent_workers=False is essential here: the loaders are
+                # REBUILT every epoch (the dataset grows). Persistent workers on
+                # a rebuilt loader accumulate zombie worker processes over a
+                # long run (~0.7-1 GB RAM each) and eventually OOM the session
+                # (observed: Kaggle 30 GB notebook restarted after ~2 h).
+                # Workers spawn/tear down per epoch now: ~2 s overhead, no leak.
+                "persistent_workers": False,
             }
             if plan.dataloader_workers > 0:
-                loader_kwargs["prefetch_factor"] = 8
+                loader_kwargs["prefetch_factor"] = 4
             # Quick validation: a fixed random slice of the val set (drawn once per
             # dataset generation) instead of the whole set — a full validation on a
             # grown val set with TTA can take an hour and starve training.
@@ -442,6 +448,10 @@ def main() -> None:
             ema.update(raw_model)
             loss_sum += float(loss.item())
             n_batches += 1
+
+        # Drop the epoch's loader (and its worker processes) before the next
+        # one is built — belt-and-braces on top of persistent_workers=False.
+        del epoch_loader
 
         avg_loss = loss_sum / max(n_batches, 1)
         seconds = time.time() - t0
