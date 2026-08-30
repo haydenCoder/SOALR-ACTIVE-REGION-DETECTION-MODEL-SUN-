@@ -171,6 +171,12 @@ TILE_GRACE_HOURS="${TILE_GRACE_HOURS:-3}"  # 0 = free a retired frame's tiles im
                                   # (an epoch that still references one gets a neutral
                                   # background sample instead of an error)
 LR="${LR:-}"                     # optional learning rate for the streaming trainer
+TORCH_COMPILE="${TORCH_COMPILE:-1}"  # 0 = skip torch.compile. The compile is a
+                                  # one-time cost paid on EVERY trainer start
+                                  # (incl. every restart), silent while it runs,
+                                  # and can take 15-40 min on a 4-core Kaggle
+                                  # box while downloads run. Set 0 for short or
+                                  # unstable sessions; 1 for a stable 12 h run.
                                   # (rolling runs use a lower LR, e.g. 1e-4, so
                                   # updates overwrite less of the old knowledge)
 
@@ -704,6 +710,8 @@ if [[ "$CONTINUOUS" == "1" ]]; then
     [[ "$DEEP_SUPERVISION" == "1" ]] && DEEP_SUPERVISION_ARG="--deep-supervision"
     LR_ARG=""
     [[ -n "$LR" ]] && LR_ARG="--lr $LR"
+    TORCH_COMPILE_ARG=""
+    [[ "$TORCH_COMPILE" == "0" ]] && TORCH_COMPILE_ARG="--no-torch-compile"
     # Supervisor loop: the streaming trainer is the heart of the run. If it
     # dies — container OOM kill (code 137), a memory self-recycle (code 42,
     # it saved a checkpoint right before), or any other crash — restart it.
@@ -722,6 +730,7 @@ if [[ "$CONTINUOUS" == "1" ]]; then
             --base-channels "$BASE_CHANNELS" \
             $DEEP_SUPERVISION_ARG \
             $LR_ARG \
+            $TORCH_COMPILE_ARG \
             --output-dir "$RESULTS_DIR/continuous" \
             --val-every "$VAL_EPOCH" \
             --max-tiles-per-epoch "$TILES_PER_EPOCH" \

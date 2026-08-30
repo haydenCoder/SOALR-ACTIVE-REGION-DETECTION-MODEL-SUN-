@@ -305,13 +305,19 @@ def main() -> None:
     elif args.torch_compile and use_dp:
         print("[compile] skipped — torch.compile does not mix with DataParallel; using eager on both GPUs", flush=True)
     elif args.torch_compile:
+        # NOTE: this is a one-time cost, paid on EVERY trainer start (including
+        # every supervisor restart / cell re-run). It is silent while it runs,
+        # so announce it explicitly — on a 4-core box it can take 15-40 min
+        # while downloads are competing for CPU.
+        print("[compile] compiling model — one-time cost (~1-5 min on 12+ cores; can take 15-40 min on a 4-core box while downloads run) ...", flush=True)
+        t_compile = time.time()
         try:
             with torch.no_grad():
                 dummy = torch.zeros(2, len(args.channels), min(args.image_size, 64), min(args.image_size, 64), device=device)
                 model = torch.compile(model, dynamic=False)
                 _ = model(dummy)
             compile_enabled = True
-            print("[compile] torch.compile active (C-level graph engine)", flush=True)
+            print(f"[compile] torch.compile active (C-level graph engine; compiled in {time.time() - t_compile:.0f}s — the first real epoch recompiles for 512^2 and is the slow one)", flush=True)
         except Exception as exc:  # noqa: BLE001
             model = AttentionUNet(
                 in_channels=len(args.channels), out_channels=1,
