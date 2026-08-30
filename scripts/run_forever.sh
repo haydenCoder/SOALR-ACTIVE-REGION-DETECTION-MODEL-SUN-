@@ -113,6 +113,13 @@ MAX_TOTAL_FRAMES="${MAX_TOTAL_FRAMES:-2000}"  # stop downloading beyond this (0 
 TILES_PER_EPOCH="${TILES_PER_EPOCH:-100}"
 VAL_EPOCH="${VAL_EPOCH:-10}"
 VAL_SUBSET="${VAL_SUBSET:-300}"
+# Stop the STREAMING trainer cleanly after this many short epochs (0 = run
+# forever until you stop the session). Use it for a bounded, deadline-safe run:
+# it saves last.pt every epoch and best.pt at every validation on the way out,
+# then exits code 0 and the loop stops instead of restarting. NOTE: set this
+# >= VAL_EPOCH (a run shorter than the first validation produces last.pt but no
+# best.pt). Example for an overnight run: MAX_EPOCHS=40 VAL_EPOCH=5.
+MAX_EPOCHS="${MAX_EPOCHS:-0}"
 MAX_CYCLES=100000          # effectively "forever"
 MIN_FREE_GB="${MIN_FREE_GB:-40}"    # refuse to download when free disk drops below this
                                   # (small machines such as Kaggle's 20 GB working
@@ -221,7 +228,7 @@ dur() { local s=$(( $2 - $1 )); printf '%dh %02dm %02ds' $(( s / 3600 )) $(( (s 
 # config so the log makes a dropped var immediately obvious.
 config_sanity() {
     hr
-    log "RESOLVED CONFIG: channels=[$CHANNELS] base=$BASE_CHANNELS deep_sup=$DEEP_SUPERVISION rolling=$ROLLING max_tiles_gb=$ROLLING_MAX_TILE_GB window=$ROLLING_WINDOW min_free=${MIN_FREE_GB}GB max_total_frames=$MAX_TOTAL_FRAMES dl_workers=$DOWNLOAD_WORKERS torch_compile=$TORCH_COMPILE lr=${LR:-default} tiles_per_epoch=$TILES_PER_EPOCH val_every=$VAL_EPOCH"
+    log "RESOLVED CONFIG: channels=[$CHANNELS] split=$MASK_SPLIT base=$BASE_CHANNELS deep_sup=$DEEP_SUPERVISION rolling=$ROLLING max_tiles_gb=$ROLLING_MAX_TILE_GB window=$ROLLING_WINDOW min_free=${MIN_FREE_GB}GB max_total_frames=$MAX_TOTAL_FRAMES max_epochs=${MAX_EPOCHS}(0=forever) dl_workers=$DOWNLOAD_WORKERS torch_compile=$TORCH_COMPILE lr=${LR:-default} tiles_per_epoch=$TILES_PER_EPOCH val_every=$VAL_EPOCH"
     local problems=0
     local free; free="$(free_gb)"
     if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -770,6 +777,9 @@ if [[ "$CONTINUOUS" == "1" ]]; then
     [[ -n "$LR" ]] && LR_ARG="--lr $LR"
     TORCH_COMPILE_ARG=""
     [[ "$TORCH_COMPILE" == "0" ]] && TORCH_COMPILE_ARG="--no-torch-compile"
+    MAX_EPOCHS_ARG=""
+    [[ "$MAX_EPOCHS" -gt 0 ]] && MAX_EPOCHS_ARG="--max-epochs $MAX_EPOCHS"
+    [[ "$MAX_EPOCHS" -gt 0 ]] && log "Bounded run: streaming trainer will stop after $MAX_EPOCHS epochs (best.pt/last.pt saved along the way)."
     # Supervisor loop: the streaming trainer is the heart of the run. If it
     # dies — container OOM kill (code 137), a memory self-recycle (code 42,
     # it saved a checkpoint right before), or any other crash — restart it.
@@ -795,6 +805,7 @@ if [[ "$CONTINUOUS" == "1" ]]; then
             --val-subset "$VAL_SUBSET" \
             --status-file "$STATUS" \
             --cpu-headroom "$CPU_HEADROOM" --memory-budget-gb 0 \
+            $MAX_EPOCHS_ARG \
             $CALIBRATE_ARG
         TRAINER_RC=$?
         if [[ $(( $(date +%s) - T_START )) -gt 1800 ]]; then
