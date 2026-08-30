@@ -171,6 +171,44 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
+def _manifest_tile_count(manifest: Path) -> int:
+    """Number of tile rows in the manifest (cheap: line count minus header)."""
+    try:
+        with manifest.open() as handle:
+            return sum(1 for _ in handle) - 1
+    except OSError:
+        return -1
+
+
+def _cgroup_memory() -> tuple[int | None, int | None]:
+    """Container memory (usage, limit) in BYTES — None when unavailable.
+
+    Reads cgroup v2 (memory.current / memory.max) or v1 (memory.usage_in_bytes /
+    memory.limit_in_bytes). A non-None limit that is absurdly large (>= 1 TiB)
+    means "effectively unlimited" and callers should treat it as None.
+    """
+    usage = limit = None
+    pairs = (
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    )
+    for cur_p, lim_p in pairs:
+        try:
+            usage = int(Path(cur_p).read_text().strip())
+        except (OSError, ValueError):
+            usage = None
+        try:
+            raw = Path(lim_p).read_text().strip()
+            limit = int(raw) if raw.isdigit() else None
+        except OSError:
+            limit = None
+        if usage is not None:
+            break
+    if limit is not None and limit >= 1024**4:  # >= 1 TiB -> effectively unlimited
+        limit = None
+    return usage, limit
+
+
 def write_status(path: str, epoch: int, n_train: int, n_val: int, line: str, best_dice: float) -> None:
     text = (
         "# Solar AR training — status (continuous mode)\n\n"
@@ -343,12 +381,24 @@ def main() -> None:
 
     print(f"[stream] watching {manifest} — training starts as soon as >= {args.min_samples} samples exist", flush=True)
 
+    last_refresh_time = 0.0
+    last_refresh_tiles = -10**9
     while not stop["flag"]:
         # ---- pick up new data: the manifest is rewritten atomically by the
         # downloader after every completed frame, so an mtime change means
-        # "new frames are available" — rebuild the dataset, keep training.
+        # "new frames are available". But rebuilding the dataset (and its
+        # worker pools) every epoch churns RAM inside a RAM-capped container,
+        # so we only rebuild when a meaningful amount of new data has arrived
+        # (>= 200 tiles ~ one download batch) or 30 minutes have passed.
         mtime = manifest.stat().st_mtime if manifest.exists() else None
-        if train_ds is None or mtime != manifest_mtime:
+        refresh_due = train_ds is None or (
+            mtime != manifest_mtime
+            and (
+                time.time() - last_refresh_time > 1800
+                or _manifest_tile_count(manifest) - last_refresh_tiles >= 200
+            )
+        )
+        if refresh_due:
             try:
                 train_ds = SolarActiveRegionDataset(
                     manifest_path=manifest, channels=args.channels, split="train",
@@ -370,18 +420,18 @@ def main() -> None:
                     time.sleep(15)
                 continue
             loader_kwargs = {
-                "num_workers": min(plan.dataloader_workers, 6),
+                "num_workers": min(plan.dataloader_workers, 4),
                 "pin_memory": plan.pin_memory,
                 # persistent_workers=False is essential here: the loaders are
-                # REBUILT every epoch (the dataset grows). Persistent workers on
-                # a rebuilt loader accumulate zombie worker processes over a
+                # REBUILT when the dataset grows. Persistent workers on a
+                # rebuilt loader accumulate zombie worker processes over a
                 # long run (~0.7-1 GB RAM each) and eventually OOM the session
                 # (observed: Kaggle 30 GB notebook restarted after ~2 h).
-                # Workers spawn/tear down per epoch now: ~2 s overhead, no leak.
+                # Workers spawn/tear down per use now: ~2 s overhead, no leak.
                 "persistent_workers": False,
             }
             if plan.dataloader_workers > 0:
-                loader_kwargs["prefetch_factor"] = 4
+                loader_kwargs["prefetch_factor"] = 2
             # Quick validation: a fixed random slice of the val set (drawn once per
             # dataset generation) instead of the whole set — a full validation on a
             # grown val set with TTA can take an hour and starve training.
@@ -395,6 +445,8 @@ def main() -> None:
             # (the train loader is built per epoch, below, so it can sample a
             #  random subset of the dataset when --max-tiles-per-epoch is set)
             manifest_mtime = mtime
+            last_refresh_time = time.time()
+            last_refresh_tiles = n_train + n_val
             sub_note = f" (validating on {val_eval_n}/{n_val} quick subset)" if val_eval_n < n_val else ""
             print(f"[stream] dataset refreshed: {n_train} train / {n_val} val tiles{sub_note} — new frames now included automatically", flush=True)
 
@@ -498,6 +550,20 @@ def main() -> None:
 
         current_lr = lr
         save_checkpoint(last_path, raw_model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
+        # ---- Container memory self-recycle: if container memory usage creeps
+        # toward the cgroup limit (observed on Kaggle 30 GiB: ~2 GB/h creep from
+        # loader/IPC churn), exit CLEANLY with code 42 right after the
+        # checkpoint save. run_forever.sh auto-restarts us and we resume from
+        # last.pt: a clean recycle costs ~20 s and loses nothing, while the
+        # alternative is the OOM killer restarting the whole container.
+        mem_used, mem_limit = _cgroup_memory()
+        if mem_used is not None and mem_limit is not None and mem_used > 0.80 * mem_limit:
+            print(
+                f"[stream] container memory high ({mem_used / 2**30:.1f} / {mem_limit / 2**30:.1f} GiB) — "
+                "checkpoint saved, self-recycling (exit 42); run_forever restarts me from last.pt",
+                flush=True,
+            )
+            sys.exit(42)
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"epoch": epoch, "loss": avg_loss, "samples": n_train}) + "\n")
         print(f"[stream] {line}", flush=True)

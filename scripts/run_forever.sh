@@ -704,24 +704,54 @@ if [[ "$CONTINUOUS" == "1" ]]; then
     [[ "$DEEP_SUPERVISION" == "1" ]] && DEEP_SUPERVISION_ARG="--deep-supervision"
     LR_ARG=""
     [[ -n "$LR" ]] && LR_ARG="--lr $LR"
-    "$PY" "$REPO_DIR/scripts/train_streaming.py" \
-        --manifest "$DATA_DIR/manifest.csv" \
-        --channels "$CHANNELS" \
-        --image-size "$PATCH_SIZE" \
-        --base-channels "$BASE_CHANNELS" \
-        $DEEP_SUPERVISION_ARG \
-        $LR_ARG \
-        --output-dir "$RESULTS_DIR/continuous" \
-        --val-every "$VAL_EPOCH" \
-        --max-tiles-per-epoch "$TILES_PER_EPOCH" \
-        --val-subset "$VAL_SUBSET" \
-        --status-file "$STATUS" \
-        --cpu-headroom "$CPU_HEADROOM" --memory-budget-gb 0 \
-        $CALIBRATE_ARG
-    TRAINER_RC=$?
-    log "Streaming trainer exited (code $TRAINER_RC) — stopping the downloader."
+    # Supervisor loop: the streaming trainer is the heart of the run. If it
+    # dies — container OOM kill (code 137), a memory self-recycle (code 42,
+    # it saved a checkpoint right before), or any other crash — restart it.
+    # It resumes from last.pt + the manifest, so a restart costs ~20 s and
+    # loses at most the in-flight epoch. A clean exit (code 0: user stop or
+    # --max-epochs) ends the run for good. A trainer that survives 30+ minutes
+    # resets the failure counter, so slow, well-spaced recycles never count
+    # against the cap; only a fast crash loop (8 in a row) stops the run.
+    TRAINER_RESTARTS=0
+    while :; do
+        T_START=$(date +%s)
+        "$PY" "$REPO_DIR/scripts/train_streaming.py" \
+            --manifest "$DATA_DIR/manifest.csv" \
+            --channels "$CHANNELS" \
+            --image-size "$PATCH_SIZE" \
+            --base-channels "$BASE_CHANNELS" \
+            $DEEP_SUPERVISION_ARG \
+            $LR_ARG \
+            --output-dir "$RESULTS_DIR/continuous" \
+            --val-every "$VAL_EPOCH" \
+            --max-tiles-per-epoch "$TILES_PER_EPOCH" \
+            --val-subset "$VAL_SUBSET" \
+            --status-file "$STATUS" \
+            --cpu-headroom "$CPU_HEADROOM" --memory-budget-gb 0 \
+            $CALIBRATE_ARG
+        TRAINER_RC=$?
+        if [[ $(( $(date +%s) - T_START )) -gt 1800 ]]; then
+            TRAINER_RESTARTS=0
+        fi
+        if [[ $TRAINER_RC -eq 0 ]]; then
+            log "Streaming trainer finished cleanly (code 0) — stopping the run."
+            break
+        fi
+        TRAINER_RESTARTS=$((TRAINER_RESTARTS+1))
+        if [[ $TRAINER_RESTARTS -ge 8 ]]; then
+            log "Streaming trainer has restarted 8 times without surviving 30 min — stopping the run (check run_forever.log for the repeated failure)."
+            break
+        fi
+        if [[ $TRAINER_RC -eq 42 ]]; then
+            log "Trainer self-recycled (container memory high, code 42) — restart #$TRAINER_RESTARTS; resuming from last.pt in 15 s."
+        else
+            log "Trainer exited unexpectedly (code $TRAINER_RC — 137 = OOM kill) — restart #$TRAINER_RESTARTS; resuming from last.pt in 15 s."
+        fi
+        sleep 15
+    done
     kill "$DOWNLOADER_PID" 2>/dev/null
-    exit "$TRAINER_RC"
+    log "Streaming trainer stopped (final code $TRAINER_RC) — stopping the downloader."
+    exit 0
 fi
 
 log "Entering the batched training loop (Ctrl-C to stop cleanly; re-run any time to resume)."
