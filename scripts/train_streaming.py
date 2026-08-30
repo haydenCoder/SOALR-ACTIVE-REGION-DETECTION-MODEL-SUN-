@@ -571,6 +571,15 @@ def main() -> None:
                         mem_limit = meminfo_b
                 except (OSError, ValueError):
                     pass
+            if epoch % 10 == 0 and mem_used is not None:
+                # Diagnostic: what the guard is actually seeing in THIS
+                # container (a misread cap shows up here immediately).
+                print(
+                    f"[mem] {mem_used / 2**30:.1f}"
+                    + (f"/{mem_limit / 2**30:.1f}" if mem_limit is not None else "/?")
+                    + " GiB",
+                    flush=True,
+                )
             if mem_used is not None and mem_limit is not None and mem_used > 0.85 * mem_limit:
                 print(
                     f"[stream] container memory high ({mem_used / 2**30:.1f} / {mem_limit / 2**30:.1f} GiB) — "
