@@ -120,6 +120,11 @@ VAL_SUBSET="${VAL_SUBSET:-300}"
 # >= VAL_EPOCH (a run shorter than the first validation produces last.pt but no
 # best.pt). Example for an overnight run: MAX_EPOCHS=40 VAL_EPOCH=5.
 MAX_EPOCHS="${MAX_EPOCHS:-0}"
+# Test-time augmentation for the streaming trainer's validation: none|flips|d4.
+# d4 averages all 8 square symmetries (best Dice, ~8x validation cost). TTA is
+# only actually applied on a FULL validation pass (VAL_SUBSET=0); a quick
+# validation subset forces it off so the fast bar stays cheap.
+TTA="${TTA:-flips}"
 MAX_CYCLES=100000          # effectively "forever"
 MIN_FREE_GB="${MIN_FREE_GB:-40}"    # refuse to download when free disk drops below this
                                   # (small machines such as Kaggle's 20 GB working
@@ -228,7 +233,7 @@ dur() { local s=$(( $2 - $1 )); printf '%dh %02dm %02ds' $(( s / 3600 )) $(( (s 
 # config so the log makes a dropped var immediately obvious.
 config_sanity() {
     hr
-    log "RESOLVED CONFIG: channels=[$CHANNELS] split=$MASK_SPLIT base=$BASE_CHANNELS deep_sup=$DEEP_SUPERVISION rolling=$ROLLING max_tiles_gb=$ROLLING_MAX_TILE_GB window=$ROLLING_WINDOW min_free=${MIN_FREE_GB}GB max_total_frames=$MAX_TOTAL_FRAMES max_epochs=${MAX_EPOCHS}(0=forever) dl_workers=$DOWNLOAD_WORKERS torch_compile=$TORCH_COMPILE lr=${LR:-default} tiles_per_epoch=$TILES_PER_EPOCH val_every=$VAL_EPOCH"
+    log "RESOLVED CONFIG: channels=[$CHANNELS] split=$MASK_SPLIT base=$BASE_CHANNELS deep_sup=$DEEP_SUPERVISION rolling=$ROLLING max_tiles_gb=$ROLLING_MAX_TILE_GB window=$ROLLING_WINDOW min_free=${MIN_FREE_GB}GB max_total_frames=$MAX_TOTAL_FRAMES max_epochs=${MAX_EPOCHS}(0=forever) tiles_per_epoch=$TILES_PER_EPOCH val_subset=$VAL_SUBSET tta=$TTA dl_workers=$DOWNLOAD_WORKERS torch_compile=$TORCH_COMPILE lr=${LR:-default} val_every=$VAL_EPOCH"
     local problems=0
     local free; free="$(free_gb)"
     if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -780,6 +785,9 @@ if [[ "$CONTINUOUS" == "1" ]]; then
     MAX_EPOCHS_ARG=""
     [[ "$MAX_EPOCHS" -gt 0 ]] && MAX_EPOCHS_ARG="--max-epochs $MAX_EPOCHS"
     [[ "$MAX_EPOCHS" -gt 0 ]] && log "Bounded run: streaming trainer will stop after $MAX_EPOCHS epochs (best.pt/last.pt saved along the way)."
+    TTA_ARG=""
+    [[ -n "$TTA" && "$TTA" != "none" ]] && TTA_ARG="--tta $TTA"
+    [[ "$TTA" != "none" ]] && log "Validation TTA: $TTA (applied on full validation passes; set VAL_SUBSET=0 to keep it on)."
     # Supervisor loop: the streaming trainer is the heart of the run. If it
     # dies — container OOM kill (code 137), a memory self-recycle (code 42,
     # it saved a checkpoint right before), or any other crash — restart it.
@@ -803,6 +811,7 @@ if [[ "$CONTINUOUS" == "1" ]]; then
             --val-every "$VAL_EPOCH" \
             --max-tiles-per-epoch "$TILES_PER_EPOCH" \
             --val-subset "$VAL_SUBSET" \
+            $TTA_ARG \
             --status-file "$STATUS" \
             --cpu-headroom "$CPU_HEADROOM" --memory-budget-gb 0 \
             $MAX_EPOCHS_ARG \
