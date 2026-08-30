@@ -12,7 +12,9 @@ torch = pytest.importorskip("torch")
 
 from solar_ar.runtime import (  # noqa: E402
     DEFAULT_CPU_BUDGET,
+    DEFAULT_CPU_HEADROOM,
     DEFAULT_MEMORY_BUDGET_GB,
+    amp_settings,
     detect_cpu_count,
     detect_memory_gb,
     plan_resources,
@@ -90,6 +92,60 @@ def test_suggest_batch_size_shrinks_as_images_grow():
 
 def test_process_memory_is_reported():
     assert process_memory_gb() >= 0
+
+
+def test_auto_cpu_budget_is_maximum_power_minus_headroom():
+    """Auto mode grabs every detected core except the OS headroom."""
+    detected = detect_cpu_count()
+    plan = plan_resources(cpu_budget=DEFAULT_CPU_BUDGET)
+    assert plan.cpu_budget == max(1, detected - DEFAULT_CPU_HEADROOM)
+
+
+def test_explicit_cpu_budget_bypasses_the_headroom():
+    """A deliberate --cpu-budget request is honoured exactly (clamped only by the hardware)."""
+    detected = detect_cpu_count()
+    plan = plan_resources(cpu_budget=detected)
+    assert plan.cpu_budget == detected
+
+
+def test_prefetch_is_maxed_out_with_workers():
+    plan = plan_resources(cpu_budget=4, memory_budget_gb=4, dataloader_workers=2)
+    assert plan.prefetch_factor == 8
+
+
+# --------------------------------------------------------------------------
+# Mixed-precision selection (CUDA fp16+scaler / MPS bfloat16 / CPU fp32)
+# --------------------------------------------------------------------------
+
+
+def test_amp_settings_cuda_uses_fp16_and_scaler():
+    assert amp_settings("cuda") == ("cuda", True, True)
+
+
+def test_amp_settings_cpu_is_plain_fp32():
+    assert amp_settings("cpu") == ("cpu", False, False)
+
+
+def test_amp_settings_mps_never_uses_a_grad_scaler():
+    """MPS runs bfloat16 autocast: no scaler needed, and none exists for MPS."""
+    autocast_type, amp_enabled, scaler_enabled = amp_settings("mps")
+    assert autocast_type in {"mps", "cpu"}
+    assert not scaler_enabled
+    if autocast_type == "mps":
+        assert amp_enabled
+
+
+def test_amp_settings_disabled_flag_is_always_inert():
+    for device in ("cpu", "cuda", "mps"):
+        assert amp_settings(device, enabled=False) == ("cpu", False, False)
+
+
+def test_amp_settings_always_yield_a_constructible_autocast():
+    """Whatever the probe picks, this torch build must accept the device type."""
+    for device in ("cpu", "cuda", "mps"):
+        autocast_type, amp_enabled, _ = amp_settings(device)
+        with torch.amp.autocast(device_type=autocast_type, enabled=amp_enabled):
+            pass
 
 
 # --------------------------------------------------------------------------

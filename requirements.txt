@@ -2,9 +2,14 @@ numpy>=1.26,<3.0
 Pillow>=10.4,<12.0
 tqdm>=4.66,<5.0
 torch>=2.4,<3.0
-# Optional: FITS support for heliophysics archives
-astropy>=6.1,<7.0
+# Optional: FITS support for heliophysics archives.
+# 5.3 is the floor so the macOS *system* Python 3.9 (Xcode CLT, no Homebrew
+# required) can install the whole file; 3.10+ machines simply get 6.x.
+astropy>=5.3,<7.0
 h5py>=3.11,<4.0
-netCDF4>=1.7,<2.0
+# 1.6 is the floor for the same reason (netCDF4 1.7+ needs Python 3.10+).
+netCDF4>=1.6,<2.0
 requests>=2.32,<3.0
 boto3>=1.34,<2.0
+
+scipy>=1.11,<2.0

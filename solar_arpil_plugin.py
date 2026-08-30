@@ -111,6 +111,8 @@ Dataset = None
 Image = None
 ImageOps = None
 load_array = None
+preferred_device = None
+amp_settings = None
 
 
 @dataclass
@@ -240,7 +242,7 @@ def load_runtime_modules() -> None:
 
 
 def _import_runtime_modules() -> None:
-    global boto3, h5py, np, requests, torch, F, fits, UNSIGNED, Config, NetCDFDataset, nn, DataLoader, Dataset, Image, ImageOps, load_array
+    global boto3, h5py, np, requests, torch, F, fits, UNSIGNED, Config, NetCDFDataset, nn, DataLoader, Dataset, Image, ImageOps, load_array, preferred_device, amp_settings
     import boto3 as _boto3
     import h5py as _h5py
     import numpy as _np
@@ -272,8 +274,11 @@ def _import_runtime_modules() -> None:
     ImageOps = _ImageOps
 
     from solar_ar.arrayio import load_array as _load_array
+    from solar_ar.runtime import amp_settings as _amp_settings, preferred_device as _preferred_device
 
     load_array = _load_array
+    preferred_device = _preferred_device
+    amp_settings = _amp_settings
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -310,14 +315,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cpu-threads",
         type=int,
-        default=4,
-        help="Target CPU cores to saturate; clamped to the cores actually available",
+        default=0,
+        help="Target CPU cores to saturate. 0 (default) = auto: use every detected core "
+        "minus the 2-core OS headroom, clamped to the cores actually available",
     )
     parser.add_argument(
         "--memory-budget-gb",
         type=float,
-        default=15.0,
-        help="Target RAM in GB, used to size the in-RAM tile cache; clamped to detected RAM",
+        default=0.0,
+        help="Target RAM in GB, used to size the in-RAM tile cache. 0 (default) = auto: "
+        "use all detected RAM, clamped to what the machine actually has",
     )
     parser.add_argument(
         "--tta",
@@ -1403,10 +1410,11 @@ def make_preview_image(image: np.ndarray, mask: np.ndarray, pred: np.ndarray, la
 
 def save_previews(model, val_rows: list[dict[str, str]], dataset_dir: Path, run_dir: Path, device, epoch: int, num_samples: int, logger: Logger) -> None:
     previews_dir = ensure_dir(run_dir / "previews")
+    amp_autocast_type, amp_enabled, _ = amp_settings(device.type)
     for row in val_rows[:num_samples]:
         image, mask = load_tile_h5(dataset_dir / row["tile_path"])
         tensor = torch.from_numpy(image[None]).to(device)
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast(device_type=amp_autocast_type, enabled=amp_enabled):
             logits = model(tensor)
             pred = (torch.sigmoid(logits)[0] > 0.5).float().cpu().numpy()
         preview = make_preview_image(image, mask, pred, [])
@@ -1470,8 +1478,17 @@ def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logg
         except (json.JSONDecodeError, OSError):
             pass
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # CUDA if available, else Apple Metal (MPS) on Apple Silicon, else CPU.
+    # MPS trains ~2-5x faster than CPU on a Mac, so it must not be skipped.
+    device = torch.device(preferred_device())
     logger.log(f"Device: {device}")
+    # Mixed precision for whichever accelerator won: fp16 + GradScaler on CUDA,
+    # bfloat16 autocast on MPS (no scaler needed), fp32 on CPU.
+    amp_autocast_type, amp_enabled, scaler_enabled = amp_settings(device.type)
+    logger.log(
+        f"Mixed precision: autocast device_type={amp_autocast_type} enabled={amp_enabled} "
+        f"grad_scaler={scaler_enabled}"
+    )
     plan = resource_plan
     if plan is not None:
         logger.log(plan.describe())
@@ -1499,7 +1516,7 @@ def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logg
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1), eta_min=args.lr * 0.05)
     criterion = BCEDiceLoss()
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
 
     metrics_path = run_dir / "metrics.jsonl"
     best_path = run_dir / "best.pt"
@@ -1515,7 +1532,7 @@ def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logg
         for batch_index, (images, masks) in enumerate(train_loader, start=1):
             images = images.to(device)
             masks = masks.to(device)
-            with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
+            with torch.amp.autocast(device_type=amp_autocast_type, enabled=amp_enabled):
                 logits = model(images)
                 loss = criterion(logits, masks)
             scaler.scale(loss / args.grad_accumulation_steps).backward()
@@ -1540,10 +1557,16 @@ def train_model(args: argparse.Namespace, dataset_dir: Path, run_dir: Path, logg
                     # logit so the existing loss and metrics still apply.
                     from solar_ar.tta import tta_predict
 
-                    logits = tta_predict(model, images, transforms=args.tta, return_logits=True)
+                    logits = tta_predict(
+                        model,
+                        images,
+                        transforms=args.tta,
+                        return_logits=True,
+                        autocast_kwargs={"device_type": amp_autocast_type, "enabled": amp_enabled},
+                    )
                     loss = criterion(logits, masks)
                 else:
-                    with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
+                    with torch.amp.autocast(device_type=amp_autocast_type, enabled=amp_enabled):
                         logits = model(images)
                         loss = criterion(logits, masks)
                 dice, iou = segmentation_metrics(logits, masks)

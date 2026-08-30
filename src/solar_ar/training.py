@@ -17,7 +17,15 @@ from tqdm import tqdm
 
 from solar_ar.data import SolarActiveRegionDataset
 from solar_ar.models import AttentionUNet
-from solar_ar.runtime import configure_runtime, process_memory_gb
+from solar_ar.runtime import (
+    DEFAULT_CPU_HEADROOM,
+    DEFAULT_MEMORY_HEADROOM_GB,
+    amp_settings,
+    configure_runtime,
+    describe_accelerator,
+    preferred_device,
+    process_memory_gb,
+)
 from solar_ar.tta import tta_predict
 
 
@@ -71,6 +79,14 @@ class ModelEma:
 
     def state_dict(self) -> dict:
         return {**{k: v.clone() for k, v in self.shadow.items()}, **self.buffers}
+
+    def load_state_dict(self, state_dict: dict, updates: int = 0) -> None:
+        """Restore EMA weights saved by a checkpoint."""
+        model_state = self.shadow | self.buffers
+        for name, value in state_dict.items():
+            if name in model_state:
+                model_state[name].copy_(value)
+        self.updates = updates
 
     def copy_to(self, model: nn.Module) -> dict:
         """Load EMA weights into ``model``, returning the previous state."""
@@ -253,6 +269,8 @@ class Trainer:
         cpu_budget: int | None = None,
         memory_budget_gb: float | None = None,
         cache_fraction: float = 0.45,
+        cpu_headroom: int = DEFAULT_CPU_HEADROOM,
+        memory_headroom_gb: float = DEFAULT_MEMORY_HEADROOM_GB,
         deep_supervision: bool = False,
         model_depth: int = 4,
         residual: bool = True,
@@ -263,9 +281,12 @@ class Trainer:
         warmup_epochs: int = 1,
         tta: str = "none",
         channels_last: bool = True,
+        resume: bool = False,
+        torch_compile: bool = True,
     ) -> None:
         seed_everything(seed)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(preferred_device())
+        self.resume = resume
 
         # Detect and claim the CPU/RAM budget before building anything heavy.
         self.resource_plan = configure_runtime(
@@ -274,8 +295,11 @@ class Trainer:
             dataloader_workers=num_workers if num_workers and num_workers > 0 else None,
             cache_fraction=cache_fraction,
             use_cuda=self.device.type == "cuda",
+            cpu_headroom=cpu_headroom,
+            memory_headroom_gb=memory_headroom_gb,
         )
         print(self.resource_plan.describe())
+        print(describe_accelerator())
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.output_dir / "metrics.jsonl"
@@ -283,7 +307,12 @@ class Trainer:
         self.last_checkpoint_path = self.output_dir / "last.pt"
         self.channels = channels
         self.epochs = epochs
-        self.amp_enabled = amp and self.device.type == "cuda"
+        # Mixed precision for whichever accelerator won: fp16 + GradScaler on
+        # CUDA, bfloat16 autocast on Apple Silicon (MPS) — the speed win on a
+        # Mac — plain fp32 on CPU.
+        self.autocast_device_type, self.amp_enabled, self.scaler_enabled = amp_settings(
+            self.device.type, enabled=amp
+        )
         self.patience = patience
         self.loss_name = loss_name
         self.grad_accumulation_steps = max(1, grad_accumulation_steps)
@@ -358,7 +387,7 @@ class Trainer:
             **loader_kwargs,
         )
 
-        self.model = AttentionUNet(
+        self.raw_model = AttentionUNet(
             in_channels=len(channels),
             out_channels=1,
             base_channels=base_channels,
@@ -368,11 +397,55 @@ class Trainer:
             use_se=use_se,
             norm_groups=norm_groups,
             deep_supervision=deep_supervision,
-        ).to(self.device)
+        )
+
+        if torch.cuda.device_count() > 1:
+            print(f"[GPU] Using {torch.cuda.device_count()} GPUs with DataParallel")
+            self.model = nn.DataParallel(self.raw_model)
+        else:
+            self.model = self.raw_model
+
+        self.model = self.model.to(self.device)
         if self.channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
 
-        self.ema = ModelEma(self.model, decay=ema_decay) if ema_decay > 0 else None
+        # C-level graph engine: torch.compile lowers the U-Net to fused,
+        # kernel-level graphs (Metal/MPS on a Mac, oneDNN on CPU), typically a
+        # further 1.2-1.5x on top of the bfloat16 autocast. It is validated
+        # with a smoke forward BEFORE training starts, and any failure falls
+        # back to eager mode — an unattended cycle must never die on a
+        # compiler bug. dynamic=False (static shapes): within one run the
+        # image size, channel count and batch size are all fixed, so nothing
+        # actually varies — except the final partial batch, which costs a
+        # couple of one-time re-compiles. Static shapes also sidestep a
+        # known inductor bug that only triggers on symbolic (dynamic)
+        # shapes (e.g. MPS: "cannot determine truth value of Relational"
+        # in WelfordReduction codegen), so compilation is far more likely
+        # to succeed.
+        # SKIPPED ON MPS: inductor-MPS in torch 2.8 compiles 512^2 graphs in
+        # 15-30+ min (per batch size), can hang the trainer, and produced a
+        # NaN loss on the first compiled epoch — eager + bfloat16 autocast is
+        # the proven path on Apple Silicon. CUDA keeps torch.compile.
+        self.compile_enabled = False
+        if torch_compile and self.device.type == "mps":
+            print("[compile] skipped on MPS (Apple Silicon) — using eager + bfloat16 autocast")
+        elif torch_compile and torch.cuda.device_count() <= 1:
+            try:
+                with torch.no_grad():
+                    dummy = torch.zeros(2, len(channels), image_size, image_size, device=self.device)
+                    if self.channels_last:
+                        dummy = dummy.to(memory_format=torch.channels_last)
+                    self.model = torch.compile(self.model, dynamic=False)
+                    _ = self.model(dummy)
+                self.compile_enabled = True
+                print("[compile] torch.compile active (C-level graph engine) — the first epoch includes one-time graph capture")
+            except Exception as exc:  # noqa: BLE001 - fall back, never crash
+                self.model = self.raw_model
+                print(f"[compile] torch.compile unavailable ({type(exc).__name__}: {exc}) — continuing in eager mode")
+        elif torch_compile:
+            print("[compile] torch.compile skipped (multi-GPU DataParallel) — using eager mode")
+
+        self.ema = ModelEma(self.raw_model, decay=ema_decay) if ema_decay > 0 else None
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=learning_rate,
@@ -386,8 +459,10 @@ class Trainer:
             learning_rate=learning_rate,
             warmup_epochs=warmup_epochs,
         )
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.scaler_enabled)
         self.criterion = build_loss(loss_name, deep_supervision=deep_supervision)
+        self.best_score = -math.inf
+        self.epochs_without_improvement = 0
 
         self._write_run_metadata()
 
@@ -396,7 +471,13 @@ class Trainer:
         payload = {
             "resource_plan": self.resource_plan.__dict__,
             "device": str(self.device),
+            "amp": {
+                "device_type": self.autocast_device_type,
+                "enabled": self.amp_enabled,
+                "grad_scaler": self.scaler_enabled,
+            },
             "amp_enabled": self.amp_enabled,
+            "torch_compile": self.compile_enabled,
             "deep_supervision": self.deep_supervision,
             "ema": self.ema is not None,
             "tta": self.tta,
@@ -406,22 +487,42 @@ class Trainer:
             json.dump(payload, handle, indent=2, default=str)
 
     def fit(self) -> None:
-        best_score = -math.inf
-        epochs_without_improvement = 0
+        start_epoch = 1
 
-        for epoch in range(1, self.epochs + 1):
+        if self.resume and self.last_checkpoint_path.exists():
+            print(f"Resuming from checkpoint: {self.last_checkpoint_path}")
+            checkpoint = torch.load(self.last_checkpoint_path, map_location=self.device)
+            # Checkpoints deliberately save the unwrapped model so they work
+            # across one-GPU and DataParallel runs.
+            self.raw_model.load_state_dict(checkpoint["model_state_dict"])
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if self.ema is not None and "ema_state_dict" in checkpoint:
+                self.ema.load_state_dict(
+                    checkpoint["ema_state_dict"], checkpoint.get("ema_updates", 0)
+                )
+            start_epoch = checkpoint["metrics"]["epoch"] + 1
+            self.best_score = checkpoint.get("best_score", checkpoint["metrics"].get("val_dice", -math.inf))
+            self.epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
+            print(f"Starting from epoch {start_epoch}")
+
+        if start_epoch > self.epochs:
+            print(f"Training is already complete at epoch {start_epoch - 1}; increase --epochs to continue.")
+            return
+
+        for epoch in range(start_epoch, self.epochs + 1):
             start = perf_counter()
             train_loss = self._run_epoch(epoch, training=True)
             train_seconds = perf_counter() - start
 
             # Validate with the EMA weights when available: they are what we
             # would actually deploy, so early stopping should track them.
-            backup = self.ema.copy_to(self.model) if self.ema is not None else None
+            backup = self.ema.copy_to(self.raw_model) if self.ema is not None else None
             try:
                 val_loss, val_dice, val_iou = self._run_epoch(epoch, training=False)
             finally:
                 if backup is not None:
-                    self.model.load_state_dict(backup)
+                    self.raw_model.load_state_dict(backup)
 
             elapsed = perf_counter() - start
             samples = max(1, len(self.train_loader.dataset))
@@ -439,14 +540,14 @@ class Trainer:
                 cache_hit_rate=self._cache_hit_rate(),
             )
             self._append_metrics(metrics)
-            self._save_checkpoint(self.last_checkpoint_path, metrics)
 
-            if val_dice > best_score:
-                best_score = val_dice
-                epochs_without_improvement = 0
+            if val_dice > self.best_score:
+                self.best_score = val_dice
+                self.epochs_without_improvement = 0
                 self._save_checkpoint(self.best_checkpoint_path, metrics)
             else:
-                epochs_without_improvement += 1
+                self.epochs_without_improvement += 1
+            self._save_checkpoint(self.last_checkpoint_path, metrics)
 
             print(
                 f"epoch={epoch:03d} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
@@ -455,7 +556,7 @@ class Trainer:
                 f"cache_hit={metrics.cache_hit_rate:.2f}"
             )
 
-            if self.patience > 0 and epochs_without_improvement >= self.patience:
+            if self.patience > 0 and self.epochs_without_improvement >= self.patience:
                 print(f"Early stopping triggered after {epoch} epochs.")
                 break
 
@@ -483,16 +584,14 @@ class Trainer:
                     self.model,
                     images,
                     transforms=self.tta,
-                    autocast_kwargs={"device_type": "cuda", "enabled": self.amp_enabled}
-                    if self.device.type == "cuda"
-                    else {"device_type": "cpu", "enabled": False},
+                    autocast_kwargs={"device_type": self.autocast_device_type, "enabled": self.amp_enabled},
                 )
                 loss = F.binary_cross_entropy(probs.clamp(1e-6, 1 - 1e-6), masks)
                 dice, iou = compute_metrics_from_probs(probs, masks)
                 total_dice += dice
                 total_iou += iou
             else:
-                with torch.amp.autocast(device_type="cuda", enabled=self.amp_enabled):
+                with torch.amp.autocast(device_type=self.autocast_device_type, enabled=self.amp_enabled):
                     logits = self.model(images)
                     loss = self.criterion(logits, masks)
 
@@ -511,7 +610,7 @@ class Trainer:
                     # Per-step LR schedule (warmup + cosine).
                     self.scheduler.step()
                     if self.ema is not None:
-                        self.ema.update(self.model)
+                        self.ema.update(self.raw_model)
 
             total_loss += float(loss.item())
             batches += 1
@@ -539,7 +638,7 @@ class Trainer:
 
     def _save_checkpoint(self, path: Path, metrics: EpochMetrics) -> None:
         payload = {
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": self.raw_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "channels": self.channels,
@@ -547,9 +646,12 @@ class Trainer:
             "tta": self.tta,
             "deep_supervision": self.deep_supervision,
         }
+        payload["best_score"] = self.best_score
+        payload["epochs_without_improvement"] = self.epochs_without_improvement
         if self.ema is not None:
             # The EMA weights are the ones that were validated, so store them
             # separately rather than overwriting the raw weights (which are
             # still needed to resume training).
             payload["ema_state_dict"] = self.ema.state_dict()
+            payload["ema_updates"] = self.ema.updates
         torch.save(payload, path)

@@ -11,7 +11,9 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from solar_ar.runtime import (
     DEFAULT_CPU_BUDGET,
+    DEFAULT_CPU_HEADROOM,
     DEFAULT_MEMORY_BUDGET_GB,
+    DEFAULT_MEMORY_HEADROOM_GB,
     plan_resources,
     suggest_batch_size,
 )
@@ -21,7 +23,7 @@ from solar_ar.tta import TTA_PRESETS
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train an Attention U-Net for solar active region segmentation.")
-    parser.add_argument("--manifest", required=True, help="CSV manifest created by scripts/prepare_uad_manifest.py")
+    parser.add_argument("--manifest", default=None, help="CSV manifest created by scripts/prepare_uad_manifest.py. If omitted, will auto-download and prepare UAD dataset.")
     parser.add_argument("--channels", nargs="+", default=["171", "195", "284", "304"], help="Channel names to use")
     parser.add_argument("--image-size", type=int, default=256, help="Training crop/resize size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
@@ -43,8 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="percentile",
         help="Per-channel normalization strategy",
     )
-    parser.add_argument("--amp", action="store_true", help="Enable mixed precision when CUDA is available")
-    parser.add_argument("--patience", type=int, default=10, help="Early-stopping patience in epochs; use 0 to disable")
+    parser.add_argument("--amp", action="store_true", default=True, help="Enable mixed precision when CUDA is available")
+    parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable mixed precision")
+    parser.add_argument("--patience", type=int, default=0, help="Early-stopping patience in epochs; 0 (default) disables it")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--loss",
@@ -105,9 +108,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fraction of the memory budget used to cache decoded samples in RAM.",
     )
     hardware.add_argument(
+        "--cpu-headroom",
+        type=int,
+        default=DEFAULT_CPU_HEADROOM,
+        help=(
+            "Cores to leave free for the OS when --cpu-budget is auto (<=0). "
+            f"Default: {DEFAULT_CPU_HEADROOM} (grab maximum power while the machine "
+            "stays usable; 0 = use every detected core on a dedicated box)."
+        ),
+    )
+    hardware.add_argument(
+        "--memory-headroom-gb",
+        type=float,
+        default=DEFAULT_MEMORY_HEADROOM_GB,
+        help=(
+            "RAM in GB to leave free when --memory-budget-gb is auto (<=0). "
+            f"Default: {DEFAULT_MEMORY_HEADROOM_GB} (0 = use all detected RAM)."
+        ),
+    )
+    hardware.add_argument(
         "--auto-batch-size",
         action="store_true",
+        default=True,
         help="Pick the largest batch size that fits the memory budget, overriding --batch-size.",
+    )
+    hardware.add_argument(
+        "--no-auto-batch-size",
+        dest="auto_batch_size",
+        action="store_false",
+        help="Disable automatic batch size selection.",
     )
     hardware.add_argument(
         "--no-channels-last",
@@ -160,11 +189,66 @@ def build_parser() -> argparse.ArgumentParser:
             "views, 'd4' averages all 8 symmetries for the best accuracy."
         ),
     )
+    optim.add_argument("--resume", action="store_true", help="Resume training from the last checkpoint in output-dir")
+    optim.add_argument(
+        "--no-torch-compile",
+        dest="torch_compile",
+        action="store_false",
+        default=True,
+        help="Disable torch.compile (C-level graph engine, ~1.2-1.5x faster). Enabled by "
+        "default with an automatic smoke-tested fallback to eager mode if unsupported.",
+    )
     return parser
+
+
+import subprocess
+
+
+def bootstrap_data() -> str:
+    manifest_path = Path("data/processed/uad_manifest.csv")
+    if manifest_path.exists():
+        return str(manifest_path)
+
+    import shutil
+    # Detect free disk space in GB
+    _, _, free_bytes = shutil.disk_usage(".")
+    free_gb = free_bytes / (1024**3)
+
+    print(f"Detected {free_gb:.1f} GB free disk space.")
+
+    print("Manifest not found. Auto-downloading and preparing data...")
+    # 1. Download primary UAD dataset (~15GB)
+    if free_gb > 15:
+        print("Downloading UAD dataset...")
+        subprocess.run(["bash", "scripts/download_uad_dataset.sh"], check=True)
+    else:
+        print("Not enough disk space for UAD dataset (>15GB required).")
+
+    # The optional sample scripts contain unlabelled demonstration files. They
+    # cannot be added to this segmentation manifest safely, so do not download
+    # them automatically or spend the user's Colab disk quota on unused data.
+
+    # 2. Prepare manifest
+    print("Preparing manifest...")
+    subprocess.run([
+        sys.executable, "scripts/prepare_uad_manifest.py",
+        "--raw-root", "data/raw/Solar_data_UAD",
+        "--output", str(manifest_path)
+    ], check=True)
+
+    print(f"Data bootstrap complete. Manifest created at {manifest_path}")
+    return str(manifest_path)
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    # Tolerate a single quoted multi-word --channels argument (e.g.
+    # --channels "aia94 aia131 ..."), which argparse would otherwise treat
+    # as one channel name.
+    args.channels = [c for part in args.channels for c in part.split()]
+
+    if args.manifest is None:
+        args.manifest = bootstrap_data()
 
     # --torch-num-threads predates --cpu-budget. When given explicitly it is a
     # deliberate override, so it becomes the CPU budget that drives the whole
@@ -182,6 +266,8 @@ def main() -> None:
             memory_budget_gb=args.memory_budget_gb,
             cache_fraction=args.cache_fraction,
             use_cuda=torch.cuda.is_available(),
+            cpu_headroom=args.cpu_headroom,
+            memory_headroom_gb=args.memory_headroom_gb,
         )
         batch_size = suggest_batch_size(
             image_size=args.image_size,
@@ -220,6 +306,8 @@ def main() -> None:
         cpu_budget=args.cpu_budget,
         memory_budget_gb=args.memory_budget_gb,
         cache_fraction=args.cache_fraction,
+        cpu_headroom=args.cpu_headroom,
+        memory_headroom_gb=args.memory_headroom_gb,
         deep_supervision=args.deep_supervision,
         model_depth=args.model_depth,
         residual=args.residual,
@@ -230,6 +318,8 @@ def main() -> None:
         warmup_epochs=args.warmup_epochs,
         tta=args.tta,
         channels_last=args.channels_last,
+        resume=args.resume,
+        torch_compile=args.torch_compile,
     )
     trainer.fit()
 

@@ -8,12 +8,14 @@ import random
 import tarfile
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import boto3
 import h5py
 import numpy as np
 import requests
+from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.client import Config
 from netCDF4 import Dataset as NetCDFDataset
@@ -111,8 +113,40 @@ def extract_mask(archive_path: Path, members: dict[str, str], mask_rel_path: str
             shutil.copyfileobj(source, handle)
 
 
-def download_core_s3(s3_client, key: str, destination: Path) -> None:
-    s3_client.download_file(CORE_BUCKET, key, str(destination))
+# Multipart download tuning: each ~570 MB frame is pulled as 12 concurrent
+# ~48 MB range-requests instead of one slow stream, so a single file already
+# saturates the link; the thread pool on top of that pulls several files at
+# once. 12 (not 16) keeps the handle count under macOS's 256 default
+# ulimit: 16 workers x 12 parts = 192 part files + masks + tiles < 256.
+S3_TRANSFER = TransferConfig(
+    max_concurrency=12,
+    multipart_chunksize=48 * 1024 * 1024,
+    use_threads=True,
+)
+
+
+def download_core_s3(s3_client, key: str, destination: Path, attempts: int = 3) -> None:
+    """Download one core frame, retrying transient network blips quickly.
+
+    With ~200 concurrent download streams, occasional "Could not connect to
+    the endpoint URL" / reset-connection errors are normal. Retrying after a
+    short backoff costs seconds; without it a blip costs the whole frame until
+    the next cycle — hours in a long unattended run.
+    """
+    if destination.exists():
+        return
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            s3_client.download_file(CORE_BUCKET, key, str(destination), Config=S3_TRANSFER)
+            return
+        except Exception as exc:  # noqa: BLE001 - any transport failure is retryable
+            last_exc = exc
+            destination.unlink(missing_ok=True)  # drop partial multipart state
+            if attempt < attempts:
+                time.sleep(2 * attempt * attempt)
+    assert last_exc is not None
+    raise last_exc
 
 
 def load_core_channels(nc_path: Path, channels: list[str]) -> np.ndarray:
@@ -140,7 +174,16 @@ def load_mask(h5_path: Path, key: str) -> np.ndarray:
 
 
 def save_compressed(path: Path, array: np.ndarray) -> None:
-    np.savez_compressed(path, array.astype(np.float32))
+    # Store tiles in float16: the training pipeline re-normalizes at load
+    # time (percentile scaling), so half the mantissa digits are more than
+    # enough — and the tile disk footprint halves (~90 MB -> ~45 MB per
+    # 13-channel frame, ~21 MB -> ~11 MB per 3-channel frame). This is what
+    # lets Kaggle's 20 GiB working quota hold ~1,000 frames instead of ~550.
+    # Values are clipped into the float16 range first (bright EUV counts can
+    # exceed 65504); the load-time percentile clipping makes the lost extreme
+    # tail immaterial. The loader is dtype-agnostic (astype float32), so
+    # float16 and legacy float32 tiles coexist in the same dataset.
+    np.savez_compressed(path, np.clip(array, -65000, 65000).astype(np.float16))
 
 
 def core_key_from_mask_path(mask_path: str) -> str:
