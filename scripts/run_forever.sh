@@ -209,6 +209,45 @@ log() { printf '[%s] %s\n' "$(ts)" "$*" | tee -a "$LOG"; }
 hr()  { printf '[%s] %s\n' "$(ts)" "════════════════════════════════════════════════════════════════" | tee -a "$LOG"; }
 dur() { local s=$(( $2 - $1 )); printf '%dh %02dm %02ds' $(( s / 3600 )) $(( (s % 3600) / 60 )) $(( s % 60 )); }
 
+# --- config sanity gate ------------------------------------------------------
+# The #1 silent failure mode on Kaggle: a stray '#' comment line inside the
+# backslash-continued VAR=value ... VAR=value ... bash run_forever.sh launch
+# chain makes bash treat the REST of that line as a comment, so every var
+# before the '#' is dropped and these all fall back to DESKTOP defaults
+# (1 channel, no rolling, MIN_FREE_GB=40, 16 downloaders, torch.compile on).
+# The script would then wait for data that never arrives (or run the wrong
+# config) for HOURS with no clear error. Fail LOUDLY at the first second when
+# a Linux/Kaggle-style box has a desktop-only value, and echo the resolved
+# config so the log makes a dropped var immediately obvious.
+config_sanity() {
+    hr
+    log "RESOLVED CONFIG: channels=[$CHANNELS] base=$BASE_CHANNELS deep_sup=$DEEP_SUPERVISION rolling=$ROLLING max_tiles_gb=$ROLLING_MAX_TILE_GB window=$ROLLING_WINDOW min_free=${MIN_FREE_GB}GB max_total_frames=$MAX_TOTAL_FRAMES dl_workers=$DOWNLOAD_WORKERS torch_compile=$TORCH_COMPILE lr=${LR:-default} tiles_per_epoch=$TILES_PER_EPOCH val_every=$VAL_EPOCH"
+    local problems=0
+    local free; free="$(free_gb)"
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        if [[ "$MIN_FREE_GB" -ge 30 && "$free" -lt 30 ]]; then
+            log "✖ FATAL CONFIG: MIN_FREE_GB=${MIN_FREE_GB} GB but only ~${free} GB is free. On Kaggle's 20 GB disk the preset sets MIN_FREE_GB=4. The value here is the DESKTOP default, meaning the preset environment variables were DROPPED (a '#' comment on a backslash-continued launch line comments out the rest of the VAR=value chain). Downloads will NEVER start and there will be no best.pt. Fix the launcher and re-run."
+            problems=$((problems+1))
+        fi
+        if [[ "$DOWNLOAD_WORKERS" -gt 8 && "$free" -lt 25 ]]; then
+            log "✖ FATAL CONFIG: DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS} on a ~${free} GB disk — each worker holds a ~0.6 GB temp file (the preset uses 4). Preset env vars were likely dropped."
+            problems=$((problems+1))
+        fi
+    fi
+    if [[ "${#CHANNELS}" -eq 0 ]]; then
+        log "✖ FATAL CONFIG: CHANNELS is empty — cannot train. Set CHANNELS (e.g. CHANNELS='aia171 aia193 hmi_m')."
+        problems=$((problems+1))
+    fi
+    if [[ "$problems" -gt 0 ]]; then
+        log "Aborting before any download/train so the misconfiguration cannot waste a multi-hour session. Export the preset variables on ONE clean backslash-continued line with NO '#' comments between them, then re-run."
+        hr
+        exit 2
+    fi
+    log "Config sanity gate passed."
+    hr
+}
+# NOTE: config_sanity is invoked below, after free_gb()/log()/hr() are defined.
+
 # --- macOS: make sure the machine will NOT sleep/turn off --------------------
 if [[ "$(uname -s)" == "Darwin" && -z "${SOLAR_CAFFEINATED:-}" && -n "$(command -v caffeinate)" ]]; then
     log "macOS detected — re-launching under 'caffeinate -is' so the machine"
@@ -267,6 +306,10 @@ completed_frames() {
     "$PY" -c 'import json,sys;print(json.load(open(sys.argv[1]))["completed_frames"])' \
         "$1/progress.json" 2>/dev/null || echo 0
 }
+
+# Now that free_gb()/log()/hr() exist, run the early config sanity gate (before
+# any venv setup / download / training so a dropped preset fails in < 1 s).
+config_sanity
 
 # Compact machine stats for the watchdog line. Cross-platform (Linux / macOS).
 sys_stats() {
@@ -413,9 +456,23 @@ PY
 
     # Cap total frames by free disk, reserving MIN_FREE_GB. Each source frame
     # yields ~3 kept 512x512 tiles (~4 MB after compression), so ~4 MB/frame.
+    # EXCEPT in ROLLING mode: there the on-disk tile set is bounded by the
+    # hard ROLLING_MAX_TILE_GB byte budget that is enforced after EVERY frame
+    # (oldest frames are retired and their tiles freed), so the dataset never
+    # grows with disk usage and "download forever" (MAX_TOTAL_FRAMES=0) must be
+    # honoured. Applying the desktop-style static frame cap here would (a)
+    # stop downloads at a few thousand frames instead of rotating forever, and
+    # — worse — with the desktop default MIN_FREE_GB=40 on a ~20 GB Kaggle disk
+    # produce disk_cap=0, which makes the downloader pause FOREVER (its guard
+    # is `free disk < MIN_FREE_GB`): the trainer then waits on an empty
+    # manifest for hours with the GPU idle and no best.pt ever written.
     local disk_free
     disk_free="$(free_gb)" || disk_free=0
-    if [[ "$disk_free" -gt 0 ]]; then
+    if [[ "$ROLLING" == "1" ]]; then
+        if [[ "$MAX_TOTAL_FRAMES" -eq 0 ]]; then
+            log "Rolling mode: MAX_TOTAL_FRAMES=0 (download new frames forever); disk is bounded by the ${ROLLING_MAX_TILE_GB} GiB rolling tile budget, not a static frame cap."
+        fi
+    elif [[ "$disk_free" -gt 0 ]]; then
         local disk_cap
         disk_cap=$(( (disk_free - MIN_FREE_GB) * 1024 / 4 ))
         [[ "$disk_cap" -lt 0 ]] && disk_cap=0
@@ -423,6 +480,7 @@ PY
             MAX_TOTAL_FRAMES="$disk_cap"
             if [[ "$disk_cap" -eq 0 ]]; then
                 log "Disk limit: not enough free space for more frames (reserve ${MIN_FREE_GB} GB) — downloads will be skipped until space frees up."
+                log "WARNING: this machine has ~${disk_free} GB free but MIN_FREE_GB=${MIN_FREE_GB}. If this is Kaggle (20 GB working disk), the preset env vars were almost certainly DROPPED (a '#' comment line inside the backslash-continued VAR=value launch chain silently drops them). Re-launch with MIN_FREE_GB=4 and the full preset — otherwise NO frames will ever download."
             else
                 log "Disk limit: MAX_TOTAL_FRAMES reduced to $disk_cap to respect the ${MIN_FREE_GB} GB reserve."
             fi
