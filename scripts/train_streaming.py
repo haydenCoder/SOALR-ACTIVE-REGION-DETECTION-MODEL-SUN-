@@ -556,14 +556,28 @@ def main() -> None:
         # checkpoint save. run_forever.sh auto-restarts us and we resume from
         # last.pt: a clean recycle costs ~20 s and loses nothing, while the
         # alternative is the OOM killer restarting the whole container.
-        mem_used, mem_limit = _cgroup_memory()
-        if mem_used is not None and mem_limit is not None and mem_used > 0.80 * mem_limit:
-            print(
-                f"[stream] container memory high ({mem_used / 2**30:.1f} / {mem_limit / 2**30:.1f} GiB) — "
-                "checkpoint saved, self-recycling (exit 42); run_forever restarts me from last.pt",
-                flush=True,
-            )
-            sys.exit(42)
+        # Two guards against false positives (a nested-cgroup read can report
+        # a limit smaller than the real container, which would trigger a
+        # recycle->restart loop on a FRESH process):
+        #   - only after 30+ minutes of healthy uptime in this process,
+        #   - against the most lenient plausible cap (cgroup limit vs
+        #     /proc/meminfo), at a conservative 85%.
+        if time.time() - t_start > 1800:
+            mem_used, mem_limit = _cgroup_memory()
+            if mem_limit is not None:
+                try:
+                    meminfo_b = int(Path("/proc/meminfo").readline().split()[1]) * 1024
+                    if meminfo_b > mem_limit:
+                        mem_limit = meminfo_b
+                except (OSError, ValueError):
+                    pass
+            if mem_used is not None and mem_limit is not None and mem_used > 0.85 * mem_limit:
+                print(
+                    f"[stream] container memory high ({mem_used / 2**30:.1f} / {mem_limit / 2**30:.1f} GiB) — "
+                    "checkpoint saved, self-recycling (exit 42); run_forever restarts me from last.pt",
+                    flush=True,
+                )
+                sys.exit(42)
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"epoch": epoch, "loss": avg_loss, "samples": n_train}) + "\n")
         print(f"[stream] {line}", flush=True)
