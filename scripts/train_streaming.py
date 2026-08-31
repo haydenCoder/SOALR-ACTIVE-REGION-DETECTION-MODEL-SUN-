@@ -568,10 +568,15 @@ def main() -> None:
                 line += f" val_dice={val_dice:.4f} val_iou={val_iou:.4f}{quick_note}"
             if not val_interrupted and target_area > 0:
                 if calibrate_pending:
+                    # First real validation on current data: discard any stale
+                    # (incomparable / inflated) bar, adopt THIS score AND save
+                    # best.pt with the current good weights immediately so the
+                    # on-disk best.pt never lingers on a fake/bad checkpoint.
                     calibrate_pending = False
                     best_dice = val_dice
-                    line += f"  (best bar calibrated to current data: {val_dice:.4f})"
-                if val_dice > best_dice:
+                    save_checkpoint(best_path, raw_model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
+                    line += f"  (best bar calibrated to current data: {val_dice:.4f}; best.pt updated)"
+                elif val_dice > best_dice:
                     best_dice = val_dice
                     save_checkpoint(best_path, raw_model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
                     line += "  ★ new best"
