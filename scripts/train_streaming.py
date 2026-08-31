@@ -384,6 +384,10 @@ def main() -> None:
     val_loader: DataLoader | None = None
     n_train = n_val = 0
     t_start = time.time()
+    # Set when a tile read fails mid-epoch because the rolling window retired
+    # the frame (rotate_window rewrites the manifest and frees the tile): forces
+    # a dataset rebuild on the next loop instead of crashing (see __getitem__).
+    force_refresh = False
 
     print(f"[stream] watching {manifest} — training starts as soon as >= {args.min_samples} samples exist", flush=True)
 
@@ -397,7 +401,7 @@ def main() -> None:
         # so we only rebuild when a meaningful amount of new data has arrived
         # (>= 200 tiles ~ one download batch) or 30 minutes have passed.
         mtime = manifest.stat().st_mtime if manifest.exists() else None
-        refresh_due = train_ds is None or (
+        refresh_due = force_refresh or train_ds is None or (
             mtime != manifest_mtime
             and (
                 time.time() - last_refresh_time > 1800
@@ -453,6 +457,7 @@ def main() -> None:
             manifest_mtime = mtime
             last_refresh_time = time.time()
             last_refresh_tiles = n_train + n_val
+            force_refresh = False
             sub_note = f" (validating on {val_eval_n}/{n_val} quick subset)" if val_eval_n < n_val else ""
             print(f"[stream] dataset refreshed: {n_train} train / {n_val} val tiles{sub_note} — new frames now included automatically", flush=True)
 
@@ -488,24 +493,42 @@ def main() -> None:
         model.train(True)
         t0 = time.time()
         loss_sum, n_batches = 0.0, 0
-        for images, masks in epoch_loader:
-            if stop["flag"]:
-                break
-            images = images.to(device, non_blocking=True)
-            masks = masks.to(device, non_blocking=True)
-            with torch.amp.autocast(device_type=autocast_type, enabled=amp_enabled):
-                logits = model(images)
-                loss = criterion(logits, masks)
-            scaler.scale(loss).backward()
-            if scaler_enabled:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            ema.update(raw_model)
-            loss_sum += float(loss.item())
-            n_batches += 1
+        try:
+            for images, masks in epoch_loader:
+                if stop["flag"]:
+                    break
+                images = images.to(device, non_blocking=True)
+                masks = masks.to(device, non_blocking=True)
+                with torch.amp.autocast(device_type=autocast_type, enabled=amp_enabled):
+                    logits = model(images)
+                    loss = criterion(logits, masks)
+                scaler.scale(loss).backward()
+                if scaler_enabled:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                ema.update(raw_model)
+                loss_sum += float(loss.item())
+                n_batches += 1
+        except (OSError, KeyError) as exc:
+            # A tile file vanished mid-epoch: the rolling window retired that
+            # frame (rewrote the manifest + freed its .h5) AFTER this dataset
+            # was built, so a DataLoader worker tried to open a deleted file.
+            # This is EXPECTED churn, not a fault — rebuild the dataset from
+            # the new manifest (which no longer lists the retired tile) and
+            # continue, instead of crashing with code 1 and restarting the
+            # whole trainer (a restart also re-pays the torch.compile cost).
+            # CUDA errors (real GPU OOM) are deliberately NOT caught here.
+            print(
+                f"[stream] epoch {epoch} aborted: a tile was retired by the rolling window "
+                f"mid-epoch ({type(exc).__name__}: {exc}) — rebuilding dataset, continuing.",
+                flush=True,
+            )
+            force_refresh = True
+            del epoch_loader
+            continue
 
         # Drop the epoch's loader (and its worker processes) before the next
         # one is built — belt-and-braces on top of persistent_workers=False.
@@ -537,22 +560,34 @@ def main() -> None:
             vb = 0
             val_interrupted = False
             with torch.no_grad():
-                for images, masks in val_loader:
-                    if stop["flag"]:
-                        val_interrupted = True
-                        break
-                    images = images.to(device, non_blocking=True)
-                    masks = masks.to(device, non_blocking=True)
-                    probs = tta_predict(
-                        model, images, transforms=val_transforms,
-                        autocast_kwargs={"device_type": autocast_type, "enabled": amp_enabled},
+                try:
+                    for images, masks in val_loader:
+                        if stop["flag"]:
+                            val_interrupted = True
+                            break
+                        images = images.to(device, non_blocking=True)
+                        masks = masks.to(device, non_blocking=True)
+                        probs = tta_predict(
+                            model, images, transforms=val_transforms,
+                            autocast_kwargs={"device_type": autocast_type, "enabled": amp_enabled},
+                        )
+                        preds = (probs > 0.5).float()
+                        inter += float((preds * masks).sum())
+                        pred_area += float(preds.sum())
+                        target_area += float(masks.sum())
+                        union_area += float((preds + masks).clamp(0, 1).sum())
+                        vb += 1
+                except (OSError, KeyError) as exc:
+                    # Same rolling-window churn as in training (a val tile was
+                    # retired mid-validation): treat as interrupted — skip the
+                    # best.pt update this pass and force a dataset refresh.
+                    print(
+                        f"[stream] validation aborted: a val tile was retired mid-pass "
+                        f"({type(exc).__name__}: {exc}) — rebuilding dataset, will validate again.",
+                        flush=True,
                     )
-                    preds = (probs > 0.5).float()
-                    inter += float((preds * masks).sum())
-                    pred_area += float(preds.sum())
-                    target_area += float(masks.sum())
-                    union_area += float((preds + masks).clamp(0, 1).sum())
-                    vb += 1
+                    val_interrupted = True
+                    force_refresh = True
             raw_model.load_state_dict(backup)
             if target_area <= 0:
                 # No active-region pixels anywhere in this validation (all
