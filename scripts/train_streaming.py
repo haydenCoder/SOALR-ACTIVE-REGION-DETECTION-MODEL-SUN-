@@ -524,11 +524,22 @@ def main() -> None:
             val_transforms = args.tta if val_eval_n >= n_val else "none"
             backup = ema.copy_to(raw_model)
             model.eval()
-            dice_sum = iou_sum = 0.0
+            # MICRO-AVERAGE over the WHOLE val set instead of averaging per-tile
+            # Dice. A tile with an empty mask (quiet Sun, or a rolling-window
+            # all-zero substitute for a just-freed tile) makes per-tile Dice
+            # eps/eps = 1.0; a handful of those in a tiny early validation
+            # (only ~12 tiles existed at the first validation) averaged to a
+            # fake "perfect" 1.0000 that then froze best.pt forever, since
+            # every later real score is lower and can never beat 1.0. Pooling
+            # sums intersections and areas across all tiles first, so empty
+            # tiles contribute nothing and the score reflects real overlap.
+            inter = pred_area = target_area = union_area = 0.0
             vb = 0
+            val_interrupted = False
             with torch.no_grad():
                 for images, masks in val_loader:
                     if stop["flag"]:
+                        val_interrupted = True
                         break
                     images = images.to(device, non_blocking=True)
                     masks = masks.to(device, non_blocking=True)
@@ -536,23 +547,34 @@ def main() -> None:
                         model, images, transforms=val_transforms,
                         autocast_kwargs={"device_type": autocast_type, "enabled": amp_enabled},
                     )
-                    d, i = compute_metrics_from_probs(probs, masks)
-                    dice_sum += d
-                    iou_sum += i
+                    preds = (probs > 0.5).float()
+                    inter += float((preds * masks).sum())
+                    pred_area += float(preds.sum())
+                    target_area += float(masks.sum())
+                    union_area += float((preds + masks).clamp(0, 1).sum())
                     vb += 1
             raw_model.load_state_dict(backup)
-            val_dice = dice_sum / max(vb, 1)
-            val_iou = iou_sum / max(vb, 1)
-            quick_note = f" ({val_eval_n} quick)" if val_eval_n < n_val else ""
-            line += f" val_dice={val_dice:.4f} val_iou={val_iou:.4f}{quick_note}"
-            if calibrate_pending:
-                calibrate_pending = False
-                best_dice = val_dice
-                line += f"  (best bar calibrated to current data: {val_dice:.4f})"
-            if val_dice > best_dice:
-                best_dice = val_dice
-                save_checkpoint(best_path, raw_model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
-                line += "  ★ new best"
+            if target_area <= 0:
+                # No active-region pixels anywhere in this validation (all
+                # tiles empty/substituted): nothing real to score, so never
+                # let an eps/eps = 1.0 become the best bar.
+                val_dice = 0.0
+                val_iou = 0.0
+                line += " val_dice=n/a (no foreground in val set — not updating best)"
+            else:
+                val_dice = (2 * inter + 1e-6) / (pred_area + target_area + 1e-6)
+                val_iou = (inter + 1e-6) / (union_area + 1e-6)
+                quick_note = f" ({val_eval_n} quick)" if val_eval_n < n_val else ""
+                line += f" val_dice={val_dice:.4f} val_iou={val_iou:.4f}{quick_note}"
+            if not val_interrupted and target_area > 0:
+                if calibrate_pending:
+                    calibrate_pending = False
+                    best_dice = val_dice
+                    line += f"  (best bar calibrated to current data: {val_dice:.4f})"
+                if val_dice > best_dice:
+                    best_dice = val_dice
+                    save_checkpoint(best_path, raw_model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
+                    line += "  ★ new best"
 
         current_lr = lr
         save_checkpoint(last_path, raw_model, optimizer, ema, epoch, best_dice, args.channels, current_lr)
