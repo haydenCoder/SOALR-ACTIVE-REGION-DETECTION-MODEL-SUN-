@@ -10,10 +10,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from solar_ar.arrayio import SUPPORTED_EXTENSIONS, load_array
+from solar_ar.arrayio import SUPPORTED_EXTENSIONS, ArrayLoadError, load_array
 
 # Re-exported for callers that historically imported it from this module.
-__all__ = ["SampleRecord", "SolarActiveRegionDataset", "SUPPORTED_EXTENSIONS"]
+__all__ = ["SampleRecord", "SolarActiveRegionDataset", "SUPPORTED_EXTENSIONS", "ArrayLoadError"]
 
 
 @dataclass
@@ -180,26 +180,34 @@ class SolarActiveRegionDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             channels = [self._load_image(path, self.hdf5_image_key) for path in record.image_paths]
             image = np.stack(channels, axis=0).astype(np.float32)
             mask = self._load_image(record.mask_path, self.hdf5_mask_key).astype(np.float32)
-        except FileNotFoundError:
-            # Rolling-window rotations delete a frame's tiles only after a
-            # multi-hour grace gap, but an epoch that started just before the
-            # rotation can still hold a reference to them. Substitute a
-            # neutral background sample (normalizes to flat) instead of
-            # crashing the whole run over one rotated-out tile.
-            if self._missing_warns < 3:
+        except (FileNotFoundError, ArrayLoadError, OSError, KeyError, ValueError):
+            # A tile could not be turned into an array. Two expected causes:
+            #   1) Rolling-window rotation retired the frame and freed its tile
+            #      files after an epoch already held references to them
+            #      (FileNotFoundError).
+            #   2) A file exists but is unreadable/corrupt/empty — load_array
+            #      raises ArrayLoadError (a RuntimeError subclass, so a narrow
+            #      FileNotFoundError guard let it crash the whole trainer with
+            #      "code 1" ~every rotation), or a container raises OSError on
+            #      a torn file / KeyError on a missing dataset.
+            # Either way one bad sample must never kill a multi-hour run:
+            # substitute a neutral background tile (normalizes to flat zeros)
+            # and keep training. The model still sees the frame in later
+            # epochs from a good copy/refresh.
+            if self._missing_warns < 5:
                 self._missing_warns += 1
                 print(
-                    f"[data] tile file missing (rotated out?) near {record.mask_path} "
+                    f"[data] tile unreadable (rotated out / corrupt?) near {record.mask_path} "
                     f"— using background substitute for this sample",
                     flush=True,
                 )
-            h = w = 512
+            h = w = self.image_size
             for path in [record.mask_path, *record.image_paths]:
                 try:
                     arr = self._load_image(path, self.hdf5_mask_key)
                     h, w = arr.shape[:2]
                     break
-                except FileNotFoundError:
+                except (FileNotFoundError, ArrayLoadError, OSError, KeyError, ValueError):
                     continue
             image = np.zeros((len(record.image_paths), h, w), dtype=np.float32)
             mask = np.zeros((h, w), dtype=np.float32)
